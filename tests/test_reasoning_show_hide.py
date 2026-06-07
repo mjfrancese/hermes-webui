@@ -297,7 +297,7 @@ class TestReasoningConfigHelpers:
         # Snapshot-style assertion: if hermes_constants adds a level, this
         # test will fail fast so we know to update WebUI too.
         assert VALID_REASONING_EFFORTS == (
-            'minimal', 'low', 'medium', 'high', 'xhigh', 'max'
+            'minimal', 'low', 'medium', 'high', 'xhigh'
         )
 
     def test_set_reasoning_effort_persists_to_config_yaml(self, tmp_path, monkeypatch):
@@ -360,10 +360,6 @@ class TestStreamingReasoningWiring:
         assert 'parse_reasoning_effort' in src, (
             "api/streaming.py must import parse_reasoning_effort to translate "
             "config.yaml agent.reasoning_effort into AIAgent reasoning_config"
-        )
-        assert 'coerce_reasoning_effort_for_model' in src, (
-            "api/streaming.py must clamp/drop unsupported model-specific effort "
-            "levels before sending reasoning_config to the provider"
         )
         assert "reasoning_config" in src and "'reasoning_config' in _agent_params" in src, (
             "api/streaming.py must guard the reasoning_config kwarg with "

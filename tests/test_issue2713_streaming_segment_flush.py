@@ -25,14 +25,14 @@ class TestFlushHelperExists:
 
     def test_flush_helper_declared(self):
         src = read("static/messages.js")
-        assert "function _flushPendingSegmentRender(options={})" in src, (
+        assert "function _flushPendingSegmentRender()" in src, (
             "_flushPendingSegmentRender helper must be declared in messages.js"
         )
 
     def test_flush_helper_guards_on_assistant_body(self):
         src = read("static/messages.js")
         m = re.search(
-            r"function _flushPendingSegmentRender\(options=\{\}\)\{.*?\n  \}",
+            r"function _flushPendingSegmentRender\(\)\{.*?\n  \}",
             src,
             re.DOTALL,
         )
@@ -45,7 +45,7 @@ class TestFlushHelperExists:
     def test_flush_helper_guards_on_render_pending(self):
         src = read("static/messages.js")
         m = re.search(
-            r"function _flushPendingSegmentRender\(options=\{\}\)\{.*?\n  \}",
+            r"function _flushPendingSegmentRender\(\)\{.*?\n  \}",
             src,
             re.DOTALL,
         )
@@ -58,7 +58,7 @@ class TestFlushHelperExists:
     def test_flush_helper_cancels_pending_raf(self):
         src = read("static/messages.js")
         m = re.search(
-            r"function _flushPendingSegmentRender\(options=\{\}\)\{.*?\n  \}",
+            r"function _flushPendingSegmentRender\(\)\{.*?\n  \}",
             src,
             re.DOTALL,
         )
@@ -71,7 +71,7 @@ class TestFlushHelperExists:
     def test_flush_helper_uses_smd_write(self):
         src = read("static/messages.js")
         m = re.search(
-            r"function _flushPendingSegmentRender\(options=\{\}\)\{.*?\n  \}",
+            r"function _flushPendingSegmentRender\(\)\{.*?\n  \}",
             src,
             re.DOTALL,
         )
@@ -84,7 +84,7 @@ class TestFlushHelperExists:
     def test_flush_helper_has_render_md_fallback(self):
         src = read("static/messages.js")
         m = re.search(
-            r"function _flushPendingSegmentRender\(options=\{\}\)\{.*?\n  \}",
+            r"function _flushPendingSegmentRender\(\)\{.*?\n  \}",
             src,
             re.DOTALL,
         )
@@ -97,7 +97,7 @@ class TestFlushHelperExists:
     def test_flush_helper_has_esc_fallback(self):
         src = read("static/messages.js")
         m = re.search(
-            r"function _flushPendingSegmentRender\(options=\{\}\)\{.*?\n  \}",
+            r"function _flushPendingSegmentRender\(\)\{.*?\n  \}",
             src,
             re.DOTALL,
         )
@@ -137,15 +137,15 @@ class TestToolHandlerFlush:
     def test_tool_handler_calls_flush(self):
         src = read("static/messages.js")
         fn = _extract_handler(src, "tool")
-        assert "_flushPendingSegmentRender({force:true})" in fn, (
-            "tool handler must force _flushPendingSegmentRender() before "
+        assert "_flushPendingSegmentRender()" in fn, (
+            "tool handler must call _flushPendingSegmentRender() before "
             "_resetAssistantSegment()"
         )
 
     def test_tool_handler_flush_before_reset(self):
         src = read("static/messages.js")
         fn = _extract_handler(src, "tool")
-        flush_pos = fn.index("_flushPendingSegmentRender({force:true})")
+        flush_pos = fn.index("_flushPendingSegmentRender()")
         reset_pos = fn.index("_resetAssistantSegment()")
         assert flush_pos < reset_pos, (
             "_flushPendingSegmentRender must be called BEFORE "
@@ -159,7 +159,7 @@ class TestInterimAssistantHandlerFlush:
     def test_interim_handler_calls_flush(self):
         src = read("static/messages.js")
         fn = _extract_handler(src, "interim_assistant")
-        assert "_flushPendingSegmentRender({force:true})" in fn, (
+        assert "_flushPendingSegmentRender()" in fn, (
             "interim_assistant handler must call _flushPendingSegmentRender() "
             "before _resetAssistantSegment()"
         )
@@ -169,63 +169,10 @@ class TestInterimAssistantHandlerFlush:
         the segment for new content (not the early alreadyStreamed branch)."""
         src = read("static/messages.js")
         fn = _extract_handler(src, "interim_assistant")
-        flush_pos = fn.index("_flushPendingSegmentRender({force:true})")
+        flush_pos = fn.index("_flushPendingSegmentRender()")
         # Find the _resetAssistantSegment call that comes AFTER the flush
         reset_pos = fn.index("_resetAssistantSegment()", flush_pos)
         assert flush_pos < reset_pos, (
             "_flushPendingSegmentRender must be called BEFORE the final "
             "_resetAssistantSegment in the interim_assistant handler"
-        )
-
-    def test_already_streamed_interim_handler_flushes_before_reset(self):
-        """already_streamed interim events are still visible-progress boundaries.
-
-        The visible text already arrived through token events, so the client
-        must not append it again. It must still flush any pending token render
-        before resetting the segment; otherwise a fast tool boundary can orphan
-        the text until a later render or session switch.
-        """
-        src = read("static/messages.js")
-        fn = _extract_handler(src, "interim_assistant")
-        branch_start = fn.index("if(alreadyStreamed)")
-        branch = fn[branch_start : fn.index("assistantText +=", branch_start)]
-        assert "ensureAssistantRow(true)" in branch, (
-            "already_streamed interim boundaries must materialize the current "
-            "token segment before reset"
-        )
-        assert "_flushPendingSegmentRender({force:true})" in branch, (
-            "already_streamed interim boundaries must flush pending token DOM "
-            "before reset"
-        )
-        inactive_guard = "if(!S.session||S.session.session_id!==activeSid){"
-        if inactive_guard in branch:
-            active_branch_start = branch.index(inactive_guard) + branch[branch.index(inactive_guard):].index("}") + 1
-        else:
-            active_branch_start = 0
-        flush_pos = branch.index("_flushPendingSegmentRender({force:true})", active_branch_start)
-        reset_pos = branch.index("_resetAssistantSegment()", active_branch_start)
-        assert flush_pos < reset_pos, (
-            "already_streamed interim flush must happen before segment reset"
-        )
-
-    def test_interim_handler_creates_visible_segment_before_forced_flush(self):
-        src = read("static/messages.js")
-        fn = _extract_handler(src, "interim_assistant")
-        ensure_pos = fn.index("ensureAssistantRow(true)")
-        flush_pos = fn.index("_flushPendingSegmentRender({force:true})")
-        reset_pos = fn.index("_resetAssistantSegment()", flush_pos)
-        assert ensure_pos < flush_pos < reset_pos, (
-            "visible interim assistant progress must create a live assistant "
-            "segment, synchronously flush it, then reset for the next segment"
-        )
-
-    def test_interim_handler_closes_activity_after_visible_progress_boundary(self):
-        src = read("static/messages.js")
-        fn = _extract_handler(src, "interim_assistant")
-        flush_pos = fn.index("_flushPendingSegmentRender({force:true})")
-        close_pos = fn.index("closeCurrentLiveActivityGroup()", flush_pos)
-        reset_pos = fn.index("_resetAssistantSegment()", close_pos)
-        assert flush_pos < close_pos < reset_pos, (
-            "visible interim assistant progress is timeline content; it must "
-            "close the current live Activity burst before later tools append"
         )

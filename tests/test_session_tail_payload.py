@@ -12,8 +12,7 @@ class _FakeSession:
         self.model_provider = None
         self.messages = messages
         self.tool_calls = [
-            {"name": "old-tool", "snippet": "historical snippet", "assistant_msg_idx": 0},
-            {"name": "visible-tool", "snippet": "visible snippet", "assistant_msg_idx": 1},
+            {"name": "old-tool", "snippet": "historical snippet", "assistant_msg_idx": 0}
         ]
         self.input_tokens = 0
         self.output_tokens = 0
@@ -44,7 +43,7 @@ class _FakeSession:
         }
 
 
-def _invoke(session, query=None):
+def _invoke(session):
     import api.routes as routes
 
     captured = {}
@@ -54,9 +53,7 @@ def _invoke(session, query=None):
         captured["status"] = status
         return data
 
-    if query is None:
-        query = "session_id=tail_payload_001&messages=1&resolve_model=0&msg_limit=1"
-    parsed = urlparse(f"/api/session?{query}")
+    parsed = urlparse("/api/session?session_id=tail_payload_001&messages=1&resolve_model=0&msg_limit=1")
     with patch("api.routes.get_session", return_value=session), \
          patch("api.routes._clear_stale_stream_state", return_value=False), \
          patch("api.routes._lookup_cli_session_metadata", return_value={}), \
@@ -66,7 +63,7 @@ def _invoke(session, query=None):
     return captured["data"]["session"]
 
 
-def test_tail_window_includes_windowed_session_tool_calls_even_when_messages_have_tool_metadata():
+def test_tail_window_omits_historical_tool_calls_when_messages_have_tool_metadata():
     session = _FakeSession([
         {"role": "user", "content": "older"},
         {
@@ -79,15 +76,11 @@ def test_tail_window_includes_windowed_session_tool_calls_even_when_messages_hav
     payload = _invoke(session)
 
     assert payload["messages"] == [session.messages[-1]]
-    # PR #3665: always return session-level tool_calls (windowed to the
-    # message window) so the browser can merge them with per-message ones.
-    assert payload["tool_calls"] == [
-        {"name": "visible-tool", "snippet": "visible snippet", "assistant_msg_idx": 0}
-    ]
+    assert payload["tool_calls"] == []
     assert payload["_messages_truncated"] is True
 
 
-def test_tail_window_keeps_only_visible_session_tool_calls_for_legacy_messages_without_metadata():
+def test_tail_window_keeps_session_tool_calls_for_legacy_messages_without_metadata():
     session = _FakeSession([
         {"role": "user", "content": "older"},
         {"role": "assistant", "content": "visible legacy message"},
@@ -96,51 +89,4 @@ def test_tail_window_keeps_only_visible_session_tool_calls_for_legacy_messages_w
     payload = _invoke(session)
 
     assert payload["messages"] == [session.messages[-1]]
-    assert payload["tool_calls"] == [
-        {"name": "visible-tool", "snippet": "visible snippet", "assistant_msg_idx": 0}
-    ]
-    assert session.tool_calls[-1]["assistant_msg_idx"] == 1
-
-
-def test_full_load_keeps_all_session_tool_calls_for_legacy_messages_without_metadata():
-    session = _FakeSession([
-        {"role": "user", "content": "older"},
-        {"role": "assistant", "content": "visible legacy message"},
-    ])
-
-    payload = _invoke(
-        session,
-        query="session_id=tail_payload_001&messages=1&resolve_model=0",
-    )
-
-    assert payload["messages"] == session.messages
     assert payload["tool_calls"] == session.tool_calls
-
-
-def test_msg_before_window_keeps_only_that_page_session_tool_calls():
-    session = _FakeSession([
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "second legacy message"},
-        {"role": "assistant", "content": "third legacy message"},
-        {"role": "assistant", "content": "fourth legacy message"},
-    ])
-    session.tool_calls = [
-        {"name": "first-page-tool", "snippet": "kept", "assistant_msg_idx": 1},
-        {"name": "second-page-tool", "snippet": "also kept", "assistant_msg_idx": 2},
-        {"name": "tail-tool", "snippet": "not in page", "assistant_msg_idx": 3},
-        {"name": "unindexed-tool", "snippet": "cannot place"},
-    ]
-
-    payload = _invoke(
-        session,
-        query="session_id=tail_payload_001&messages=1&resolve_model=0&msg_before=3&msg_limit=2",
-    )
-
-    assert payload["messages"] == session.messages[1:3]
-    assert payload["tool_calls"] == [
-        {"name": "first-page-tool", "snippet": "kept", "assistant_msg_idx": 0},
-        {"name": "second-page-tool", "snippet": "also kept", "assistant_msg_idx": 1},
-    ]
-    assert session.tool_calls[0]["assistant_msg_idx"] == 1
-    assert session.tool_calls[1]["assistant_msg_idx"] == 2
-    assert payload["_messages_offset"] == 1

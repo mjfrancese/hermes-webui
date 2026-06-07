@@ -1,0 +1,137 @@
+/* ── Starrco Profile Theme ──────────────────────────────────────────────────
+ * Applied when body[data-profile="starrco"] (set by starrco-profile.js).
+ * Isolated from style.css so upstream rebases on the starrco-patches branch
+ * have zero merge surface here -- this file is new, never touched upstream.
+ *
+ * Starrco brand colors (Color Code Sheet 2021-12-16):
+ *   Starrco Blue 21 : #202E7C  (brand anchor -- dark base)
+ *   Boardwalk Blue  : #0077C8
+ *   Light Blue      : #00A9E0
+ *   Medium Yellow   : #FFD900  (primary accent)
+ *   Depth Yellow    : #EBB323
+ *   Process Black   : #231F20
+ *   50% Grey        : #7F7F7F
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/* ── Core palette override (dark mode -- Michael prefers dark) ── */
+/* Overrides both light and dark base vars so the theme is consistent
+   regardless of the user's light/dark toggle in Settings. */
+body[data-profile="starrco"],
+body[data-profile="starrco"].dark {
+  /* Backgrounds */
+  --bg:          #0D1520;
+  --sidebar:     #111E32;
+  --code-bg:     #0A1628;
+  --surface:     #162640;
+  --main-bg:     rgba(13,21,32,0.55);
+  --topbar-bg:   rgba(11,18,35,0.98);
+
+  /* Borders */
+  --border:      #1A3054;
+  --border2:     rgba(0,119,200,0.25);
+  --border-subtle:  rgba(0,119,200,0.12);
+  --border-muted:   rgba(0,119,200,0.20);
+
+  /* Text */
+  --text:   #D8EAF5;
+  --muted:  #7F9DB5;
+  --strong: #F0F8FF;
+  --em:     #A8C8E8;
+  --pre-text: #D8EAF5;
+
+  /* Accent -- Starrco Medium Yellow (#FFD900) */
+  --accent:          #FFD900;
+  --accent-hover:    #EBB323;
+  --accent-bg:       rgba(255,217,0,0.09);
+  --accent-bg-strong:rgba(255,217,0,0.18);
+  --accent-text:     #FFD900;
+  --gold:            #EBB323;
+
+  /* Blue -- Light Blue for links/info */
+  --blue: #00A9E0;
+
+  /* Interactive */
+  --input-bg:  rgba(255,255,255,0.04);
+  --hover-bg:  rgba(0,119,200,0.08);
+  --focus-ring:rgba(255,217,0,0.40);
+  --focus-glow:rgba(255,217,0,0.10);
+  --surface-subtle:      rgba(0,169,224,0.04);
+  --surface-subtle-hover:rgba(0,169,224,0.08);
+
+  /* Code */
+  --code-text:      #7BBFDA;
+  --code-inline-bg: rgba(0,0,0,0.40);
+
+  /* Status (keep readable on dark navy) */
+  --error:   #EF5350;
+  --success: #4CAF50;
+  --warning: #FFA726;
+  --info:    #00A9E0;
+}
+
+/* ── Titlebar: replace caduceus + "Hermes" with Starrco logo wordmark ── */
+
+/* Widen the icon slot to fit the wordmark (578:119 ratio = ~4.86:1).
+   At 20px tall the logo needs ~97px wide. We use 110px for breathing room. */
+body[data-profile="starrco"] .app-titlebar-icon {
+  width:  110px;
+  height: 22px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Hide the default caduceus SVG */
+body[data-profile="starrco"] .app-titlebar-icon svg {
+  display: none;
+}
+
+/* Paint the Starrco wordmark as a CSS background (data URI -- no network request) */
+body[data-profile="starrco"] .app-titlebar-icon::after {
+  content: '';
+  display: block;
+  width:  100%;
+  height: 100%;
+  background-image: url("data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNTc4IiBoZWlnaHQ9IjExOSIgdmlld0JveD0iMCAwIDU3Ny45NiAxMTguOTgiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CiAgPHBvbHlnb24gcG9pbnRzPSI0OC43NSAxLjYgMjMuNzggMTYuMDIgNzUuMyA0NS43NyAxMDAuMjggMzEuMzUiIGZpbGw9IiNDOERDRUYiIG9wYWNpdHk9IjAuNiIvPgogIDxwb2x5Z29uIHBvaW50cz0iNzUuMyA0NS43NyA3NS4zIDcwLjE0IDEwMC4yNyA1NS43MiAxMDAuMjcgMzEuMzUiIGZpbGw9IiNDOERDRUYiIG9wYWNpdHk9IjAuNyIvPgogIDxwb2x5Z29uIHBvaW50cz0iNTEuNTMgMCAyNi41NiAxNC40MiA3OC4wOCA0NC4xNiAxMDMuMDYgMjkuNzUiIGZpbGw9IiNDOERDRUYiLz4KICA8cG9seWdvbiBwb2ludHM9Ijc4LjA4IDQ0LjE2IDc4LjA4IDY4LjUzIDEwMy4wNiA1NC4xMiAxMDMuMDYgMjkuNzUiIGZpbGw9IiNDOERDRUYiIG9wYWNpdHk9IjAuODUiLz4KICA8cG9seWdvbiBwb2ludHM9IjQ4Ljg2IDMzLjYyIDIzLjg5IDE5LjIgMi43OCAzMS4zOCAyNy43NSA0NS44IiBmaWxsPSIjQzhEQ0VGIiBvcGFjaXR5PSIwLjciLz4KICA8cG9seWdvbiBwb2ludHM9IjIuNzggMzEuMzcgMi43OCA5MC44NyAyNy43NiAxMDUuMjggMjcuNzYgNDUuNzkiIGZpbGw9IiNDOERDRUYiIG9wYWNpdHk9IjAuNiIvPgogIDxwb2x5Z29uIHBvaW50cz0iMCAyOS43NiAwIDg5LjI2IDI0Ljk3IDEwMy42OCAyNC45NyA0NC4xOCIgZmlsbD0iI0M4RENFRiIvPgogIDxwb2x5Z29uIHBvaW50cz0iNDYuMDcgMzIgMjEuMSAxNy41OCAwIDI5Ljc2IDI0Ljk3IDQ0LjE4IiBmaWxsPSIjQzhEQ0VGIi8+CiAgPHBvbHlnb24gcG9pbnRzPSIzMC40MiA3NC45NSAzMC40MiAxMDMuNzkgNTEuNTMgMTE1Ljk4IDUxLjUzIDg3LjE0IiBmaWxsPSIjQzhEQ0VGIiBvcGFjaXR5PSIwLjYiLz4KICA8cG9seWdvbiBwb2ludHM9IjUxLjUzIDExNS45OCAxMDMuMDYgODYuMjIgMTAzLjA2IDU3LjM4IDUxLjUzIDg3LjE0IiBmaWxsPSIjQzhEQ0VGIiBvcGFjaXR5PSIwLjciLz4KICA8cG9seWdvbiBwb2ludHM9IjMwLjQyIDc3Ljk1IDMwLjQyIDEwNi43OSA1MS41MyAxMTguOTggNTEuNTMgOTAuMTQiIGZpbGw9IiNDOERDRUYiLz4KICA8cG9seWdvbiBwb2ludHM9IjUxLjUzIDExOC45OCAxMDMuMDYgODkuMjIgMTAzLjA2IDYwLjM4IDUxLjUzIDkwLjE0IiBmaWxsPSIjQzhEQ0VGIi8+CiAgPHBhdGggZD0ibTE0NC40MSw5OC45NWMtMy4wNywwLTUuODgtLjIxLTguMzYtLjYzLTIuNDctLjQyLTQuNy0uOTUtNi42NC0xLjU4LTEuOTQtLjYzLTMuNjctMS4zMy01LjE1LTIuMDctMS40Ny0uNzQtMi43Ni0xLjQ3LTMuODEtMi4xOGwtMS4yNS0uODQsOC4zNi0xMy45MywxLjUuODdjMi41NSwxLjQ5LDUuMzgsMi42NSw4LjQsMy40NiwzLjAxLjgxLDUuNzMsMS4yMiw4LjA5LDEuMjIsMS4xNCwwLDIuNjYtLjEzLDQuNTMtLjM5LDEuODEtLjI1LDMuNjItLjczLDUuMzgtMS40MSwxLjY5LS42NiwzLjE5LTEuNTYsNC40Ni0yLjY5LDEuMDgtLjk2LDEuNjktMi4xOCwxLjg1LTMuNzQuMTktMS44NS0uMzMtMy4zNC0xLjYxLTQuNTMtMS41MS0xLjQxLTMuNTEtMi42OS01Ljk0LTMuODEtMi41NS0xLjE3LTUuMzUtMi4zMy04LjM0LTMuNDctMy4xMi0xLjE4LTYuMDMtMi42Mi04LjY0LTQuMjYtMi43Mi0xLjctNC45NC0zLjgzLTYuNi02LjM1LTEuNzUtMi42NC0yLjQzLTUuOTktMi4wMS05Ljk3LjI5LTIuNzksMS4xNC01LjU3LDIuNTItOC4yNSwxLjM5LTIuNjksMy4zNS01LjE0LDUuODEtNy4yNywyLjQ1LTIuMTEsNS40Mi0zLjg0LDguODQtNS4xNCwzLjQxLTEuMyw3LjM4LTEuOTYsMTEuNzktMS45NiwyLjczLDAsNS40LjIzLDcuOTIuNjksMi40OC40NSw0LjcyLjk2LDYuNjcsMS41MSwyLC41NywzLjYsMS4xLDQuODksMS42NCwxLjU5LjY2LDEuOTYuNzcsMi4wNC43OWwxLjkxLjUyLS45OSwxLjg3LTYuMzYsMTEuNjYtMS40Ny0uNTRjLTIuNjYtLjk5LTUuMzUtMS43OS03Ljk5LTIuMzgtMi41OS0uNTgtNS4wNC0uODgtNy4yNy0uODgtMy43NywwLTYuODIuNzItOS4wNywyLjE1LTIuMDUsMS4yOS0zLjE1LDIuODUtMy4zNSw0Ljc3LS4xNywxLjYzLjMzLDIuODcsMS42LDMuOSwxLjUzLDEuMjYsMy41NSwyLjQyLDYuMDEsMy40NCwyLjU2LDEuMDcsNS4zOCwyLjE3LDguNCwzLjI5LDMuMTQsMS4xNiw2LjA3LDIuNjcsOC43LDQuNTEsMi43MSwxLjg5LDQuOSw0LjMyLDYuNTEsNy4yMiwxLjY3LDIuOTksMi4yNyw2LjgxLDEuNzksMTEuMzUtLjM3LDMuNDktMS4zNiw2LjcxLTIuOTQsOS41Ny0xLjYsMi44OS0zLjgzLDUuNC02LjYzLDcuNDctMi43NiwyLjA0LTYuMTYsMy42My0xMC4xMSw0Ljc0LTMuODksMS4wOS04LjQxLDEuNjUtMTMuNDMsMS42NSIgZmlsbD0iI0M4RENFRiIvPgogIDxwb2x5Z29uIHBvaW50cz0iMTk3LjcxIDk4LjQ5IDIwNC4xNCAzNy4yOCAxODYuNTQgMzcuMjggMTg4LjEzIDIyLjE2IDIzOS40NiAyMi4xNiAyMzcuODcgMzcuMjggMjE5Ljg2IDM3LjI4IDIxMy40MyA5OC40OSIgZmlsbD0iI0M4RENFRiIvPgogIDxwYXRoIGQ9Im0yNzcuMjQsOTguODlsLS4zNC0xLjAzYy0uMTUtLjQ3LS40Mi0xLjMxLS43OS0yLjUyLS4zNy0xLjItLjgzLTIuNjYtMS4zOS00LjM5LS41NS0xLjc0LTEuMTUtMy42Ni0xLjgtNS43NiwwLDAtMS4xMi0zLjYzLTEuNjktNS40OWgtMjIuODJsLTEwLjAyLDE5LjJoLTE1Ljg3bDEuMzItMi40Yy4zMy0uNiwxLjExLTIuMDcsMi4zNS00LjQyLDEuMjUtMi4zNywyLjgxLTUuMzEsNC42OC04LjgxczMuOTQtNy40LDYuMjMtMTEuN2MyLjI5LTQuMyw0LjYzLTguNjksNy4wNC0xMy4xNiwyLjQtNC40Niw0Ljc0LTguODUsNy4wMy0xMy4xNCwyLjI5LTQuMyw0LjM2LTguMiw2LjIzLTExLjcxLDEuODctMy41LDMuNDItNi40Myw0LjY3LTguNzksMS4yNi0yLjM4LDIuMDUtMy44OCwyLjM4LTQuNDhsMS45NC0zLjUxLDEuMTksMy41MmMuMi42LjcsMi4wOSwxLjQ5LDQuNDYuNzksMi4zNywxLjc1LDUuMzEsMi44OCw4LjgxczIuMzksNy40LDMuNzcsMTEuNzFjMS4zOCw0LjMsMi44LDguNjgsNC4yNywxMy4xNCwxLjQ2LDQuNDcsMi44OSw4Ljg2LDQuMjcsMTMuMTYsMS4zOCw0LjMsMi42NCw4LjIsMy43NywxMS43LDEuMTMsMy41LDIuMDgsNi40NCwyLjgzLDguODEuNzUsMi4zNSwxLjIyLDMuODIsMS40Miw0LjQybC44MiwyLjQxaC0xNS44NnYtLjAzWm0tMTAuMjctMzIuOTNsLTQuMjUtMTMuNzctNy4yMiwxMy43N3MxMS40NywwLDExLjQ3LDBaIiBmaWxsPSIjQzhEQ0VGIi8+CiAgPHBhdGggZD0ibTMzOC44LDk4LjQ5bC0uNDItLjc4Yy0yLjUxLTQuNjctNC44OC05LjA5LTcuMTEtMTMuMjYtMi4wNi0zLjg0LTQuMDgtNy41Ni02LjAyLTExLjA2aC04LjU3bC0yLjY0LDI1LjFoLTE1LjYybDguMDItNzYuMzNoMjIuMzFjNC4xNiwwLDcuOTYuNTcsMTEuMywxLjY4LDMuMzksMS4xMyw2LjI0LDIuOCw4LjQ4LDQuOTQsMi4yNiwyLjE2LDMuOTMsNC44Niw0Ljk2LDguMDEsMS4wMiwzLjE0LDEuMzQsNi43LjkzLDEwLjU4LS4yMiwyLjEtLjY2LDQuMjMtMS4zLDYuMzQtLjY1LDIuMTItMS41NSw0LjItMi42OCw2LjE5LTEuMTUsMi4wMS0yLjU4LDMuODktNC4yNiw1LjU3LTEuMjcsMS4yNy0yLjcxLDIuNDMtNC4yOSwzLjQ0bDIuODMsNS40MWMxLjE2LDIuMjMsMi4zNCw0LjQ4LDMuNTQsNi43NSwxLjE5LDIuMjcsMi40Myw0LjYsMy43MSw2Ljk5LDEuMjgsMi40LDIuNjcsNSw0LjE4LDcuOGwxLjQyLDIuNjRoLTE4Ljc3LDBabS0xMi40Ni00MC4wM2MyLjI0LDAsNC4xNC0uMzcsNS42My0xLjExLDEuNTMtLjc1LDIuNzktMS42NiwzLjc0LTIuNzEuOTYtMS4wNCwxLjY4LTIuMTgsMi4xNC0zLjM4LjQ5LTEuMjguNzktMi40NS45LTMuNDkuMS0uOTguMDYtMi4xMy0uMTQtMy40My0uMTgtMS4yLS42My0yLjM2LTEuMzQtMy40NC0uNy0xLjA2LTEuNzQtMS45Ny0zLjA5LTIuNzItMS4zNC0uNzMtMy4xOS0xLjExLTUuNS0xLjExaC04LjE5bC0yLjI1LDIxLjM4aDguMVoiIGZpbGw9IiNDOERDRUYiLz4KICA8cGF0aCBkPSJtNDAzLjIyLDk4LjQ5bC0uNDItLjc4Yy0yLjUxLTQuNjctNC44OC05LjA5LTcuMTEtMTMuMjYtMi4wNi0zLjg0LTQuMDgtNy41Ni02LjAyLTExLjA2aC04LjU3bC0yLjY0LDI1LjFoLTE1LjYybDguMDItNzYuMzNoMjIuMzFjNC4xNiwwLDcuOTYuNTcsMTEuMywxLjY4LDMuMzksMS4xMyw2LjI0LDIuOCw4LjQ4LDQuOTQsMi4yNiwyLjE2LDMuOTMsNC44Niw0Ljk2LDguMDEsMS4wMiwzLjE0LDEuMzQsNi43LjkzLDEwLjU4LS4yMiwyLjEtLjY2LDQuMjMtMS4zLDYuMzQtLjY1LDIuMTItMS41NSw0LjItMi42OCw2LjE5LTEuMTUsMi4wMS0yLjU4LDMuODktNC4yNiw1LjU3LTEuMjcsMS4yNy0yLjcxLDIuNDMtNC4yOSwzLjQ0bDIuODMsNS40MWMxLjE2LDIuMjMsMi4zNCw0LjQ4LDMuNTQsNi43NSwxLjE5LDIuMjcsMi40Myw0LjYsMy43MSw2Ljk5LDEuMjgsMi40LDIuNjcsNSw0LjE4LDcuOGwxLjQyLDIuNjRoLTE4Ljc3LDBabS0xMi40Ni00MC4wM2MyLjI0LDAsNC4xNC0uMzcsNS42My0xLjExLDEuNTMtLjc1LDIuNzktMS42NiwzLjc0LTIuNzEuOTYtMS4wNCwxLjY4LTIuMTgsMi4xNC0zLjM4LjQ5LTEuMjguNzktMi40NS45LTMuNDkuMS0uOTguMDYtMi4xMy0uMTQtMy40My0uMTgtMS4yLS42My0yLjM2LTEuMzQtMy40NC0uNy0xLjA2LTEuNzQtMS45Ny0zLjA5LTIuNzItMS4zNC0uNzMtMy4xOS0xLjExLTUuNS0xLjExaC04LjE5bC0yLjI1LDIxLjM4aDguMVoiIGZpbGw9IiNDOERDRUYiLz4KICA8cGF0aCBkPSJtNDYzLjEsOTkuMzNjMi44OCwwLDUuNjQtLjIzLDguMi0uNjgsMi41NC0uNDUsNC44NS0xLjAxLDYuODgtMS42NiwyLjA0LS42NiwzLjg0LTEuMzksNS4zNS0yLjE2LDEuNTEtLjc3LDIuNjYtMS40MywzLjUyLTJsMS4yMy0uODItNi41Ni0xMy43NS0yLjQxLDEuMTJjLS4xNS4xMS0uNDIuMjctLjg4LjUzLS44OC40OC0yLjA1Ljk4LTMuNDksMS40OC0xLjQ2LjUtMy4xNy45Ny01LjEsMS4zOS0xLjg3LjQtMy44My42MS01Ljg0LjYxLTMuNDcsMC02LjY2LS42Ny05LjQ4LTEuOTktMi44Ni0xLjM0LTUuMzYtMy4xMi03LjQ0LTUuMjktMi4wNy0yLjE2LTMuNy00LjY5LTQuODUtNy41MS0xLjE0LTIuODEtMS43Mi01LjY4LTEuNzItOC43MXMuNjItNiwxLjgyLTguODRjMS4yMS0yLjg1LDIuOTEtNS4zOCw1LjA0LTcuNTEsMi4xNC0yLjE0LDQuNzItMy44OSw3LjY4LTUuMiwyLjkzLTEuMjksNi4xOC0xLjk1LDkuNjYtMS45NS45MywwLDIuMDIuMDYsMy4yMi4xOSwxLjIyLjEzLDIuNDQuMzEsMy42MS41MywxLjE1LjIyLDIuMjYuNTEsMy4zLjg4Ljk5LjM1LDEuODQuNzYsMi41MiwxLjIxbDEuNTIsMS4wMS45MS0xLjU5Yy44MS0xLjQyLDEuNDMtMi41MywxLjg3LTMuMzQuNDMtLjc5LjgyLTEuNDksMS4xOC0yLjExLjM3LS42NC43My0xLjI3LDEuMDctMS44OC4zLS41NS43NC0xLjI3LDEuMzQtMi4ybC43MS0xLjEtLjg3LS45N2MtLjc3LS44Ni0yLjEzLTEuNjMtMy41My0yLjMyLTEuNDEtLjctMy4xMy0xLjItNS4wMS0xLjY5LTEuODYtLjQ4LTMuODYtLjg5LTUuOTMtMS4xOS0yLjExLS4zMS00LjIzLS40Ny02LjMtLjQ3LTUuNCwwLTEwLjU1Ljk5LTE1LjMsMi45M3MtOC45Nyw0LjctMTIuNTUsOC4yMWMtMy41NywzLjUxLTYuNDQsNy43My04LjUyLDEyLjU1LTIuMDgsNC44My0zLjE0LDEwLjE1LTMuMTQsMTUuODMsMCw1LjEyLjg4LDEwLjA3LDIuNjEsMTQuNywxLjc0LDQuNjcsNC4yOCw4LjgsNy41NiwxMi4yOCwzLjI4LDMuNDksNy4zNCw2LjMsMTIuMDcsOC4zNSw0LjcyLDIuMDUsMTAuMTMsMy4wOSwxNi4wOCwzLjA5IiBmaWxsPSIjQzhEQ0VGIi8+CiAgPHBhdGggZD0ibTUyNS42NCw5OS4yOWMtNS4zNSwwLTEwLjQ0LTEuMDItMTUuMTMtMy4wNC00LjY4LTIuMDEtOC44My00LjgxLTEyLjM0LTguMzEtMy41LTMuNS02LjMyLTcuNjUtOC4zNi0xMi4zMy0yLjA1LTQuNy0zLjA5LTkuNzktMy4wOS0xNS4xNHMxLjA0LTEwLjM1LDMuMDktMTUuMDhjMi4wNC00LjcxLDQuODUtOC44OSw4LjM1LTEyLjQzLDMuNS0zLjUzLDcuNjUtNi4zOCwxMi4zMi04LjQ2LDQuNy0yLjA5LDkuNzktMy4xNSwxNS4xNS0zLjE1czEwLjM2LDEuMDYsMTUuMDksMy4xNWM0LjcxLDIuMDgsOC44OSw0LjkyLDEyLjQyLDguNDYsMy41MywzLjUzLDYuMzYsNy43Miw4LjQxLDEyLjQzLDIuMDUsNC43MywzLjA5LDkuODEsMy4wOSwxNS4wOHMtMS4wNCwxMC40NC0zLjA5LDE1LjE0Yy0yLjA1LDQuNjgtNC44OCw4LjgzLTguNDEsMTIuMzMtMy41NCwzLjUtNy43Miw2LjMtMTIuNDMsOC4zMS00LjczLDIuMDEtOS44LDMuMDQtMTUuMDcsMy4wNG0wLTYyLjcxYy0zLjIxLDAtNi4yNi42Mi05LjA2LDEuODYtMi44MiwxLjI0LTUuMjksMi45Ni03LjM1LDUuMTItMi4wOCwyLjE3LTMuNzUsNC43NC00Ljk2LDcuNjMtMS4yMSwyLjg3LTEuODIsNi0xLjgyLDkuMjlzLjYxLDYuNDIsMS44Miw5LjI5YzEuMjEsMi44OCwyLjksNS40Miw1LjAzLDcuNTUsMi4xNCwyLjE0LDQuNjYsMy44Niw3LjQ4LDUuMDksMi44LDEuMjMsNS44OCwxLjg2LDkuMTYsMS44NnM2LjE2LS42Miw4Ljk2LTEuODZjMi44MS0xLjI0LDUuMjktMi45NSw3LjM2LTUuMDgsMi4wNy0yLjE0LDMuNzQtNC42OCw0Ljk1LTcuNTcsMS4yMS0yLjg4LDEuODItNiwxLjgyLTkuMjlzLS42My02LjQtMS44Ni05LjI4Yy0xLjI0LTIuODktMi45NS01LjQ2LTUuMDYtNy42NC0yLjEtMi4xNi00LjYtMy44OS03LjQxLTUuMTMtMi44LTEuMjMtNS44NS0xLjg2LTkuMDYtMS44NiIgZmlsbD0iI0M4RENFRiIvPgo8L3N2Zz4K");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: left center;
+}
+
+/* Hide the "Hermes" text -- the wordmark carries both mark + name */
+body[data-profile="starrco"] #appTitlebarTitle {
+  display: none;
+}
+
+/* ── Topbar background override (ensures the dark navy shows in the bar) ── */
+body[data-profile="starrco"] .app-titlebar {
+  background: var(--topbar-bg);
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Sidebar: Boardwalk Blue left-border on the active rail button ── */
+body[data-profile="starrco"] .rail-btn.active {
+  border-left: 2px solid #0077C8;
+  color: #00A9E0;
+}
+
+/* ── Session list: yellow left accent on the active session ── */
+body[data-profile="starrco"] .session-item.active {
+  border-left-color: #FFD900;
+}
+
+/* ── Composer: accent the Send button border with Starrco yellow ── */
+body[data-profile="starrco"] .composer-send-btn {
+  border-color: var(--accent);
+}
+
+/* ── Scrollbar: dark navy track, Boardwalk Blue thumb ── */
+body[data-profile="starrco"] ::-webkit-scrollbar-track {
+  background: #0D1520;
+}
+body[data-profile="starrco"] ::-webkit-scrollbar-thumb {
+  background: #1A3054;
+}
+body[data-profile="starrco"] ::-webkit-scrollbar-thumb:hover {
+  background: #0077C8;
+}

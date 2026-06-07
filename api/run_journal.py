@@ -50,6 +50,10 @@ def _lock_for(path: Path) -> threading.Lock:
         if lock is None:
             lock = threading.Lock()
             _WRITER_LOCKS[key] = lock
+            # Evict oldest entries to bound dict size; keys are per-run-file,
+            # accumulate without bound otherwise (one entry per chat turn ever).
+            while len(_WRITER_LOCKS) > 500:
+                _WRITER_LOCKS.pop(next(iter(_WRITER_LOCKS)))
         return lock
 
 
@@ -199,15 +203,12 @@ def read_run_events(
     run_id: str,
     *,
     after_seq: int | None = None,
-    max_seq: int | None = None,
     session_dir: Path | None = None,
 ) -> dict:
     path = _run_path(session_id, run_id, session_dir=session_dir)
     events, malformed = _read_jsonl(path)
     if after_seq is not None:
         events = [event for event in events if int(event.get("seq") or 0) > int(after_seq)]
-    if max_seq is not None:
-        events = [event for event in events if int(event.get("seq") or 0) <= int(max_seq)]
     return {
         "session_id": str(session_id),
         "run_id": str(run_id),
@@ -265,8 +266,7 @@ def stale_interrupted_event(session_id: str, run_id: str, *, after_seq: int | No
         return None
     payload = {
         "type": "interrupted",
-        "recovery_control": True,
-        "message": "The live worker stopped before this run finished.",
+        "message": "WebUI restarted or lost the live worker before this run finished.",
         "hint": "The transcript was restored to the last journaled event. Start a new turn if you still need the task to continue.",
         "session_id": session_id,
         "stream_id": run_id,
@@ -282,7 +282,7 @@ def stale_interrupted_event(session_id: str, run_id: str, *, after_seq: int | No
         "type": "apperror",
         "created_at": time.time(),
         "terminal": True,
-        "terminal_state": "lost-worker-bookkeeping",
+        "terminal_state": "stale-from-restart",
         "payload": payload,
         "synthetic": True,
     }

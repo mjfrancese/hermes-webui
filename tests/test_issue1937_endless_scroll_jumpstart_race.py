@@ -106,13 +106,13 @@ def test_load_older_aborts_when_generation_changed():
     )
 
 
-def test_load_older_generation_check_runs_before_replace():
-    """Generation check must come BEFORE the `S.messages = nextMessages` mutation."""
+def test_load_older_generation_check_runs_before_prepend():
+    """Generation check must come BEFORE the `S.messages = [...older, ...]` mutation."""
     body = _function_body(SESSIONS_JS, "_loadOlderMessages")
     guard_idx = body.index("if (_messagesGeneration !== startGeneration) return;")
-    replace_idx = body.index("S.messages = nextMessages;")
-    assert guard_idx < replace_idx, (
-        "Generation guard must short-circuit BEFORE the message-array mutation. "
+    prepend_idx = body.index("S.messages = [...olderMsgs, ...S.messages];")
+    assert guard_idx < prepend_idx, (
+        "Generation guard must short-circuit BEFORE the prepend. "
         "Otherwise duplicate messages can still slip through. See #1937."
     )
 
@@ -122,16 +122,10 @@ def test_load_older_generation_check_runs_before_replace():
 # ---------------------------------------------------------------------------
 
 def test_ensure_all_bumps_generation_before_replace():
-    """Bump must happen BEFORE the wholesale `S.messages =` replace so racing prefetch sees it."""
-    import re
+    """Bump must happen BEFORE `S.messages = msgs` so racing prefetch sees it."""
     body = _function_body(SESSIONS_JS, "_ensureAllMessagesLoaded")
     bump_idx = body.rindex("_bumpMessagesGeneration()")
-    # Match the wholesale replace by its LHS, not the RHS variable name — #3306
-    # added an ephemeral-field carry-forward so the RHS is now `_msgsToAssign`
-    # rather than the literal `msgs`. The invariant we protect is bump-before-replace.
-    m = re.search(r"S\.messages\s*=\s*\w+;", body)
-    assert m is not None, "expected a wholesale `S.messages = <var>;` replace in _ensureAllMessagesLoaded"
-    replace_idx = m.start()
+    replace_idx = body.index("S.messages = msgs;")
     assert bump_idx < replace_idx, (
         "_ensureAllMessagesLoaded must bump the generation token BEFORE the "
         "wholesale replace, otherwise an in-flight prefetch's post-await "
@@ -207,15 +201,10 @@ def test_ensure_all_resets_oldest_idx():
 
 def test_ensure_all_guards_against_session_switch_mid_await():
     """Same-session check must run after await — old version skipped this."""
-    import re
     body = _function_body(SESSIONS_JS, "_ensureAllMessagesLoaded")
     await_idx = body.index("await api(")
     sid_check_idx = body.index("S.session.session_id !== sid", await_idx)
-    # #3306 renamed the replace RHS from `msgs` to `_msgsToAssign` (carry-forward);
-    # match by LHS so the ordering invariant survives the rename.
-    m = re.search(r"S\.messages\s*=\s*\w+;", body[await_idx:])
-    assert m is not None, "expected a wholesale `S.messages = <var>;` replace after the await"
-    replace_idx = await_idx + m.start()
+    replace_idx = body.index("S.messages = msgs;", await_idx)
     assert await_idx < sid_check_idx < replace_idx, (
         "_ensureAllMessagesLoaded must guard against session-switch races "
         "(re-check S.session.session_id after await) BEFORE wholesale-"

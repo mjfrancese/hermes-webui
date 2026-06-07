@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from api.workspace import rmtree_anchored, safe_resolve_ws, unlink_anchored
+from api.workspace import safe_resolve_ws
 
 
 GIT_TIMEOUT = 5
@@ -977,16 +978,9 @@ def git_discard(workspace: str | Path, paths: Iterable[str], *, delete_untracked
                     raise GitWorkspaceError("Untracked files require delete_untracked=true")
                 target = safe_resolve_ws(ctx.workspace, workspace_rel)
                 if target.is_dir():
-                    rmtree_anchored(ctx.workspace, target)
+                    shutil.rmtree(target)
                 else:
-                    try:
-                        unlink_anchored(ctx.workspace, target)
-                    except FileNotFoundError:
-                        # Preserve the previous Path.unlink(missing_ok=True)
-                        # behavior for benign races where another process
-                        # removes the untracked file after git_status() has
-                        # reported it but before this discard reaches unlink.
-                        pass
+                    target.unlink(missing_ok=True)
                 continue
             _run_git(ctx, ["restore", "--worktree", "--", repo_rel], check=True)
     return git_status(workspace)

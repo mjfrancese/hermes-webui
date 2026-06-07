@@ -26,16 +26,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # ── Basic layout ──────────────────────────────────────────────────────────────
-import api.paths as _paths
-from api.plugin_providers import (
-    effective_provider_display_name as _effective_provider_display_name,
-    is_plugin_model_provider as _is_plugin_model_provider,
-)
-
-HOME = _paths.HOME
-_hermes_home_has_webui_state = _paths._hermes_home_has_webui_state
-_platform_default_hermes_home = _paths._platform_default_hermes_home
-
+HOME = Path.home()
 # REPO_ROOT is the directory that contains this file's parent (api/ -> repo root)
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 
@@ -43,34 +34,14 @@ REPO_ROOT = Path(__file__).parent.parent.resolve()
 HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.getenv("HERMES_WEBUI_PORT", "8787"))
 
-
-def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
-    """Read a positive int from the environment, falling back on bad input.
-
-    Used for operator-tunable memory caps (issue #3506) so large installs can
-    shrink the agent/session caches without editing source. A missing, empty,
-    non-numeric, or below-``minimum`` value falls back to ``default`` so a typo
-    can never disable a cache bound entirely.
-    """
-    raw = os.getenv(name)
-    if raw is None or not str(raw).strip():
-        return default
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    return value if value >= minimum else default
-
 # ── TLS/HTTPS config (optional, env-overridable) ────────────────────────────
 TLS_CERT = os.getenv("HERMES_WEBUI_TLS_CERT", "").strip() or None
 TLS_KEY = os.getenv("HERMES_WEBUI_TLS_KEY", "").strip() or None
 TLS_ENABLED = TLS_CERT is not None and TLS_KEY is not None
 
 # ── State directory (env-overridable, never inside repo) ──────────────────────
-_DEFAULT_HERMES_HOME = _platform_default_hermes_home()
-
 STATE_DIR = (
-    Path(os.getenv("HERMES_WEBUI_STATE_DIR", str(_DEFAULT_HERMES_HOME / "webui")))
+    Path(os.getenv("HERMES_WEBUI_STATE_DIR", str(HOME / ".hermes" / "webui")))
     .expanduser()
     .resolve()
 )
@@ -83,12 +54,6 @@ LAST_WORKSPACE_FILE = STATE_DIR / "last_workspace.txt"
 PROJECTS_FILE = STATE_DIR / "projects.json"
 
 logger = logging.getLogger(__name__)
-
-# Keep custom provider /v1/models probes below the frontend's generic request
-# timeout even when one upstream is slow or unreachable. The models cache rebuild
-# path probes configured custom endpoints serially, so each provider needs a
-# short hard cap and graceful degradation.
-CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS = 5.0
 
 
 def _env_mb_bytes(name: str, default_mb: int) -> int:
@@ -143,7 +108,7 @@ def _discover_agent_dir() -> Path:
         )
 
     # 2. HERMES_HOME / hermes-agent
-    hermes_home = os.getenv("HERMES_HOME", str(_DEFAULT_HERMES_HOME))
+    hermes_home = os.getenv("HERMES_HOME", str(HOME / ".hermes"))
     candidates.append(Path(hermes_home).expanduser() / "hermes-agent")
 
     # 3. Sibling: <repo-root>/../hermes-agent
@@ -154,7 +119,7 @@ def _discover_agent_dir() -> Path:
         candidates.append(REPO_ROOT.parent)
 
     # 5. ~/.hermes/hermes-agent (explicit common path)
-    candidates.append(_DEFAULT_HERMES_HOME / "hermes-agent")
+    candidates.append(HOME / ".hermes" / "hermes-agent")
 
     # 6. ~/hermes-agent
     candidates.append(HOME / "hermes-agent")
@@ -206,10 +171,9 @@ def _discover_python(agent_dir: Path) -> str:
             return str(venv_py_win)
 
     # Local .venv inside this repo
-    for subdir, binary in (("bin", "python"), ("Scripts", "python.exe")):
-        local_venv = REPO_ROOT / ".venv" / subdir / binary
-        if local_venv.exists():
-            return str(local_venv)
+    local_venv = REPO_ROOT / ".venv" / "bin" / "python"
+    if local_venv.exists():
+        return str(local_venv)
 
     # Fall back to system python3
     import shutil
@@ -249,18 +213,6 @@ else:
     _HERMES_FOUND = False
 
 # ── Config file (reloadable -- supports profile switching) ──────────────────
-
-def _expand_env_vars(obj):
-    """Recursively expand ${VAR} references in config values using os.environ."""
-    if isinstance(obj, str):
-        return re.sub(r"\${([^}]+)}", lambda m: os.environ.get(m.group(1), m.group(0)), obj)
-    if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
-    return obj
-
-
 _cfg_cache = {}
 _cfg_lock = threading.Lock()
 _cfg_mtime: float = 0.0  # last known mtime of config.yaml; 0 = never loaded
@@ -315,27 +267,11 @@ def _get_config_path() -> Path:
 
         return get_active_hermes_home() / "config.yaml"
     except ImportError:
-        return _DEFAULT_HERMES_HOME / "config.yaml"
+        return HOME / ".hermes" / "config.yaml"
 
 
 _WEBUI_SESSION_SAVE_MODES = {"deferred", "eager"}
 _DEFAULT_WEBUI_SESSION_SAVE_MODE = "deferred"
-_DEFAULT_EXPERIMENTAL_CONFIG = {
-    # Dormant first slice for the unified SessionDB migration. Runtime WebUI
-    # session call sites must continue using the existing JSON paths unless a
-    # later PR deliberately enables and wires this flag.
-    "unified_session_db": False,
-}
-
-
-def _apply_config_defaults(config_data: dict) -> None:
-    """Populate documented default-only config keys in-place."""
-    experimental = config_data.get("experimental")
-    if not isinstance(experimental, dict):
-        experimental = {}
-        config_data["experimental"] = experimental
-    for key, value in _DEFAULT_EXPERIMENTAL_CONFIG.items():
-        experimental.setdefault(key, value)
 
 
 def get_config() -> dict:
@@ -383,19 +319,6 @@ def get_webui_session_save_mode(config_data: dict | None = None) -> str:
     return _DEFAULT_WEBUI_SESSION_SAVE_MODE
 
 
-def is_unified_session_db_enabled(config_data: dict | None = None) -> bool:
-    """Return the dormant unified-session-db feature flag.
-
-    The default is intentionally false so adding the JSON adapter cannot change
-    runtime persistence until a later migration PR switches call sites.
-    """
-    active_cfg = config_data if isinstance(config_data, dict) else cfg
-    experimental = active_cfg.get("experimental", {}) if isinstance(active_cfg, dict) else {}
-    if not isinstance(experimental, dict):
-        return False
-    return experimental.get("unified_session_db") is True
-
-
 def reload_config() -> None:
     """Reload config.yaml from the active profile's directory."""
     global _cfg_mtime, _cfg_path, _cfg_fingerprint
@@ -413,14 +336,13 @@ def reload_config() -> None:
             if config_path.exists():
                 loaded = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
-                    _cfg_cache.update(_expand_env_vars(loaded))
+                    _cfg_cache.update(loaded)
                     try:
                         _cfg_mtime = Path(config_path).stat().st_mtime
                     except OSError:
                         _cfg_mtime = 0.0
         except Exception:
             logger.debug("Failed to load yaml config from %s", config_path)
-        _apply_config_defaults(_cfg_cache)
         _cfg_fingerprint = _fingerprint_config(_cfg_cache)
         # Bust the models cache so the next request sees fresh config values.
         # Only delete the disk cache when config has actually changed -- not on
@@ -441,47 +363,10 @@ def _load_yaml_config_file(config_path: Path) -> dict:
         return {}
     try:
         loaded = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        return _expand_env_vars(loaded) if isinstance(loaded, dict) else {}
+        return loaded if isinstance(loaded, dict) else {}
     except Exception:
         logger.debug("Failed to parse yaml config from %s", config_path)
         return {}
-
-
-def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
-    """Return the config dict for an explicit profile home directory.
-
-    The streaming agent runs on a detached worker thread that does NOT inherit
-    the per-request thread-local profile context (set from the ``hermes_profile``
-    cookie on the HTTP handler thread). On that worker, the ambient
-    ``get_config()`` resolves through ``get_active_profile_name()`` which falls
-    back to the process-global ``_active_profile`` (usually ``default``) — so a
-    session running under a non-default profile would silently read the
-    **default** profile's ``config.yaml`` for toolsets, prefill context, and
-    fallback chains (issue #3294).
-
-    This helper reads the config for a *known* profile home directly off disk,
-    bypassing the thread-local resolver entirely. When ``profile_home`` matches
-    the path the ambient resolver would pick (the common single-profile case),
-    we return the cached ``get_config()`` to preserve in-memory overrides used
-    by tests and runtime callers. Only when the session's profile home diverges
-    from the ambient path do we read the session profile's file directly — a
-    pure read with no global cache mutation, so it is race-free across
-    concurrent sessions on different profiles.
-    """
-    if not profile_home:
-        return get_config()
-    try:
-        target = Path(profile_home).expanduser()
-    except Exception:
-        return get_config()
-    # If the ambient resolver already points at this profile home, defer to
-    # get_config() so in-memory overrides (monkeypatched cfg) are honored.
-    try:
-        if _get_config_path().parent == target:
-            return get_config()
-    except Exception:
-        pass
-    return _load_yaml_config_file(target / "config.yaml")
 
 
 def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
@@ -630,7 +515,7 @@ def verify_hermes_imports() -> tuple:
 
 
 # ── Limits ───────────────────────────────────────────────────────────────────
-MAX_FILE_BYTES = 400_000
+MAX_FILE_BYTES = 200_000
 MAX_UPLOAD_BYTES = _env_mb_bytes("HERMES_WEBUI_MAX_UPLOAD_MB", 20)
 
 # ── File type maps ───────────────────────────────────────────────────────────
@@ -781,7 +666,6 @@ _FALLBACK_MODELS = [
     # Mistral
     {"provider": "Mistral",   "id": "mistralai/mistral-large-latest",     "label": "Mistral Large"},
     # MiniMax
-    {"provider": "MiniMax",   "id": "minimax/MiniMax-M3",               "label": "MiniMax M3"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7",             "label": "MiniMax M2.7"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7-highspeed",   "label": "MiniMax M2.7 Highspeed"},
     # Z.AI / GLM
@@ -807,11 +691,9 @@ _PROVIDER_DISPLAY = {
     "openrouter": "OpenRouter",
     "anthropic": "Anthropic",
     "openai": "OpenAI",
-    "openai-api": "OpenAI API",
     "openai-codex": "OpenAI Codex",
     "xai-oauth": "xAI Grok OAuth",
     "copilot": "GitHub Copilot",
-    "cursor-acp": "Cursor ACP",
     "zai": "Z.AI / GLM",
     "kimi-coding": "Kimi / Moonshot",
     "deepseek": "DeepSeek",
@@ -1165,12 +1047,6 @@ _PROVIDER_MODELS = {
         {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
         {"id": "gpt-5.4",      "label": "GPT-5.4"},
     ],
-    "openai-api": [
-        {"id": "gpt-5.5",      "label": "GPT-5.5"},
-        {"id": "gpt-5.5-mini", "label": "GPT-5.5 Mini"},
-        {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
-        {"id": "gpt-5.4",      "label": "GPT-5.4"},
-    ],
     "openai-codex": [
         {"id": "gpt-5.5", "label": "GPT-5.5"},
         {"id": "gpt-5.5-mini", "label": "GPT-5.5 Mini"},
@@ -1217,13 +1093,17 @@ _PROVIDER_MODELS = {
         {"id": "kimi-k2.5", "label": "Kimi K2.5"},
     ],
     "minimax": [
-        {"id": "MiniMax-M3", "label": "MiniMax M3"},
         {"id": "MiniMax-M2.7", "label": "MiniMax M2.7"},
         {"id": "MiniMax-M2.7-highspeed", "label": "MiniMax M2.7 Highspeed"},
+        {"id": "MiniMax-M2.5", "label": "MiniMax M2.5"},
+        {"id": "MiniMax-M2.5-highspeed", "label": "MiniMax M2.5 Highspeed"},
+        {"id": "MiniMax-M2.1", "label": "MiniMax M2.1"},
     ],
     "minimax-cn": [
-        {"id": "MiniMax-M3", "label": "MiniMax M3"},
         {"id": "MiniMax-M2.7", "label": "MiniMax M2.7"},
+        {"id": "MiniMax-M2.5", "label": "MiniMax M2.5"},
+        {"id": "MiniMax-M2.1", "label": "MiniMax M2.1"},
+        {"id": "MiniMax-M2", "label": "MiniMax M2"},
     ],
     # GitHub Copilot — model IDs served via the Copilot API
     "copilot": [
@@ -1235,13 +1115,6 @@ _PROVIDER_MODELS = {
         {"id": "claude-opus-4.6", "label": "Claude Opus 4.6"},
         {"id": "claude-sonnet-4.6", "label": "Claude Sonnet 4.6"},
         {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash Preview"},
-    ],
-    # Cursor ACP — models served via Cursor CLI agent acp
-    "cursor-acp": [
-        {"id": "cursor/composer-2.5", "label": "Composer 2.5"},
-        {"id": "cursor/composer-2", "label": "Composer 2"},
-        {"id": "cursor/default", "label": "Default"},
-        {"id": "cursor-acp", "label": "Cursor ACP"},
     ],
     # OpenCode Zen — curated models via opencode.ai/zen (pay-as-you-go credits)
     "opencode-zen": [
@@ -1356,29 +1229,14 @@ _PROVIDER_MODELS = {
 
 _AMBIENT_GH_CLI_MARKERS = frozenset({"gh_cli", "gh auth token"})
 
-# Environment variable sources that are auto-detected and should be filtered
-# when the token is a classic PAT (ghp_*) that Copilot API doesn't support.
-# Note: COPILOT_GITHUB_TOKEN is NOT included here - it's user-specific config.
-_AMBIENT_GH_ENV_SOURCES = frozenset({"env:github_token", "env:gh_token"})
-
 
 def _is_ambient_gh_cli_entry(source: str, label: str, key_source: str) -> bool:
     """True when a credential-pool entry is a seeded gh-cli token rather than
     one the user added explicitly. Filter these so Copilot doesn't appear in
     the dropdown just because `gh` is installed on the system.
-
-    Also filters GITHUB_TOKEN and GH_TOKEN env var entries, which are
-    auto-detected from the environment and should not cause Copilot to appear
-    in the picker when the token is a classic PAT (ghp_*) that Copilot API
-    doesn't support.
-
-    Note: COPILOT_GITHUB_TOKEN is NOT filtered - it's user-specific config
-    that should always be respected.
     """
-    source_lower = source.strip().lower()
     return (
-        source_lower in _AMBIENT_GH_CLI_MARKERS
-        or source_lower in _AMBIENT_GH_ENV_SOURCES
+        source.strip().lower() in _AMBIENT_GH_CLI_MARKERS
         or label.strip().lower() == "gh auth token"
         or key_source.strip().lower() == "gh auth token"
     )
@@ -2114,12 +1972,6 @@ def resolve_custom_provider_connection(provider_id: str) -> tuple[str | None, st
     return None, None
 
 
-# Subprocess ACP transports (Cursor/Copilot CLI). Model IDs often contain '/'
-# but must still route via explicit @provider:model so they do not fall through
-# to the configured default HTTP provider (e.g. openai-codex).
-_ACP_SUBPROCESS_PROVIDERS = frozenset({"cursor-acp", "copilot-acp"})
-
-
 def model_with_provider_context(model_id: str, model_provider: str | None = None) -> str:
     """Return the model string to pass to ``resolve_model_provider()``.
 
@@ -2138,11 +1990,6 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     config_provider = None
     if isinstance(model_cfg, dict):
         config_provider = str(model_cfg.get("provider") or "").strip().lower()
-
-    # ACP subprocess providers always need the explicit hint — their slash IDs
-    # are not OpenRouter paths and must not inherit config_provider routing.
-    if provider in _ACP_SUBPROCESS_PROVIDERS:
-        return f"@{provider}:{model}"
 
     # If the selected provider is already the configured provider, leaving the
     # model bare preserves provider-specific base_url/proxy settings.
@@ -2186,7 +2033,7 @@ def get_effective_default_model(config_data: dict | None = None) -> str:
 # Mirrors hermes_constants.parse_reasoning_effort so WebUI can validate without
 # importing from the agent tree (which may not be installed).  Any drift here
 # will show up in the shared test suite since both sides accept the same set.
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 
 def parse_reasoning_effort(effort):
@@ -2207,321 +2054,7 @@ def parse_reasoning_effort(effort):
     return None
 
 
-def _strip_provider_hint_for_reasoning(model_id: str) -> str:
-    """Remove WebUI routing hints before provider-specific capability lookup."""
-    model = str(model_id or "").strip()
-    if model.startswith("@") and ":" in model:
-        return model.split(":", 1)[1]
-    return model
-
-
-def _reasoning_name_candidates(model_id: str) -> list[str]:
-    """Return normalized model-name candidates for heuristic capability checks."""
-    bare = str(model_id or "").strip().lower().rsplit("/", 1)[-1]
-    if not bare:
-        return []
-
-    candidates: list[str] = []
-
-    def _add(value: str) -> None:
-        candidate = str(value or "").strip().lower()
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-
-    _add(bare)
-
-    dot_parts = [part for part in bare.split(".") if part]
-    if len(dot_parts) > 1:
-        # Try progressively stripping dot-separated vendor namespaces so inputs like
-        # "moonshotai.kimi-k2.5" and "vendor.deepseek.v3.2" both surface the real
-        # model family rather than treating every dot as part of the provider slug.
-        for index in range(1, len(dot_parts)):
-            suffix = ".".join(dot_parts[index:])
-            if any(ch.isalpha() for ch in suffix):
-                _add(suffix)
-
-    for candidate in list(candidates):
-        normalized = re.sub(r"[^a-z0-9]+", "-", candidate).strip("-")
-        _add(normalized)
-
-    return candidates
-
-
-def _candidate_supports_reasoning(candidate: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", "-", str(candidate or "").strip().lower()).strip("-")
-    if not normalized:
-        return False
-
-    tokens = [token for token in normalized.split("-") if token]
-    token_set = set(tokens)
-
-    if "thinking" in token_set or "reasoning" in token_set:
-        return True
-    if "gpt" in token_set or normalized.startswith("gpt"):
-        # Restrict to GPT-5+ (exclude GPT-4o/4.1/3.5 — reasoning_effort unsupported)
-        m = re.search(r"gpt-(\d+)", normalized)
-        if m and int(m.group(1)) >= 5:
-            return True
-        return False
-    if normalized in {"o1", "o3", "o4"} or normalized.startswith(("o1-", "o3-", "o4-")):
-        return True
-    if "claude" in token_set or normalized.startswith("claude"):
-        # Restrict to Claude 4+ or Claude 3.7+ (exclude Claude 3.0/3.5)
-        match = re.search(r"claude.*?(\d+)(?:\D+(\d+))?", normalized)
-        if match:
-            major = int(match.group(1))
-            minor = int(match.group(2)) if match.group(2) else 0
-            if major >= 4 or (major == 3 and minor >= 7):
-                return True
-        return False
-    if "qwen" in token_set or normalized.startswith("qwen"):
-        # Restrict to Qwen 3+ (exclude Qwen 2/2.5)
-        match = re.search(r"qwen.*?(\d+)(?:\D+(\d+))?", normalized)
-        if match:
-            major = int(match.group(1))
-            if major >= 3:
-                return True
-        return False
-    if "kimi" in token_set or normalized.startswith("kimi"):
-        return True
-    if "minimax" in token_set or normalized.startswith("minimax"):
-        return True
-    if "mimo" in token_set or normalized.startswith("mimo"):
-        return True
-    if "glm" in token_set or normalized.startswith("glm"):
-        return True
-    if "step" in token_set or normalized.startswith("step"):
-        return True
-    if "deepseek" in token_set:
-        # Check the token immediately after "deepseek" for a V-series or R-series
-        # version marker (e.g. "v4", "r1"). This is position-independent so it
-        # handles bare "deepseek-v4-flash" and @custom:name:DeepSeek-V4-Flash
-        # (→ "my-provider-deepseek-v4-flash") equally, while correctly excluding
-        # non-reasoning models like deepseek-chat and deepseek-coder.
-        # Using tokens.index() ensures the provider slug (e.g. "vertex" in
-        # "vertex-deepseek-chat") cannot falsely trigger the version guard.
-        idx = tokens.index("deepseek")
-        if idx + 1 < len(tokens) and tokens[idx + 1].startswith(("v", "r")):
-            return True
-    return False
-
-
-def _filter_reasoning_efforts_for_provider(
-    efforts: list[str],
-    model_id: str,
-    provider_id: str,
-) -> list[str]:
-    """Apply provider/model quirks to otherwise valid reasoning effort levels."""
-    normalized = [
-        str(eff).strip().lower()
-        for eff in efforts
-        if str(eff).strip().lower() in VALID_REASONING_EFFORTS
-    ]
-    normalized = list(dict.fromkeys(normalized))
-    provider = _resolve_provider_alias(str(provider_id or "").strip().lower())
-    bare = _strip_provider_hint_for_reasoning(model_id).lower().rsplit("/", 1)[-1]
-    if provider == "openai-codex":
-        if bare.startswith(("o1", "o3", "o4")):
-            return [eff for eff in normalized if eff in {"low", "medium", "high"}]
-        if bare.startswith("gpt-5"):
-            return [eff for eff in normalized if eff != "max"]
-    return normalized
-
-
-def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
-    """Fallback when hermes_cli is unavailable."""
-    model = _strip_provider_hint_for_reasoning(model_id).lower()
-    provider = _resolve_provider_alias(str(provider_id or "").strip().lower())
-    if not model or provider in {"cursor-acp", "copilot-acp"}:
-        return []
-    bare = model.rsplit("/", 1)[-1]
-    if provider == "openai-codex" and bare.startswith(("gpt-5", "o1", "o3", "o4")):
-        if bare.startswith(("o1", "o3", "o4")):
-            return ["low", "medium", "high"]
-        return _filter_reasoning_efforts_for_provider(
-            list(VALID_REASONING_EFFORTS), model, provider
-        )
-    if provider in {"copilot", "github-copilot"}:
-        if bare.startswith(("gpt-5", "o1", "o3", "o4")):
-            if bare.startswith(("o1", "o3", "o4")):
-                return ["low", "medium", "high"]
-            return list(VALID_REASONING_EFFORTS)
-    prefixes = (
-        "deepseek/",
-        "anthropic/",
-        "openai/",
-        "x-ai/",
-        "google/gemini-2",
-        "google/gemma-4",
-        "qwen/qwen3",
-        "tencent/hy3-preview",
-        "xiaomi/",
-    )
-    if any(model.startswith(prefix) for prefix in prefixes):
-        return list(VALID_REASONING_EFFORTS)
-    # Named custom providers often rewrite model ids with dots, underscores, or
-    # extra vendor namespaces. Normalize those shapes before applying family-level
-    # reasoning heuristics so "deepseek.v3.2", "deepseek_v4_flash", and
-    # "vendor.deepseek.v3.2" are treated consistently.
-    if any(_candidate_supports_reasoning(candidate) for candidate in _reasoning_name_candidates(bare)):
-        return list(VALID_REASONING_EFFORTS)
-    return []
-
-
-def _models_dev_reasoning_efforts(model_id: str, provider_id: str) -> list[str] | None:
-    """Return reasoning efforts from Hermes Agent model metadata when known.
-
-    ``None`` means the metadata source is unavailable or has no answer, so the
-    caller should continue to compatibility fallbacks. A concrete list (including
-    ``[]``) is authoritative.
-    """
-    model = _strip_provider_hint_for_reasoning(model_id)
-    provider = str(provider_id or "").strip().lower()
-    if not model or not provider:
-        return None
-
-    try:
-        from agent.models_dev import get_model_capabilities
-    except Exception:
-        return None
-
-    try:
-        capabilities = get_model_capabilities(provider=provider, model=model)
-    except Exception:
-        return None
-    if capabilities is None:
-        return None
-
-    supports_reasoning = getattr(capabilities, "supports_reasoning", None)
-    if supports_reasoning is True:
-        return _filter_reasoning_efforts_for_provider(
-            list(VALID_REASONING_EFFORTS), model, provider
-        )
-    if supports_reasoning is False:
-        return []
-    return None
-
-
-def resolve_model_reasoning_efforts(
-    model_id: str | None = None,
-    provider_id: str | None = None,
-    base_url: str | None = None,
-) -> list[str]:
-    """Return supported reasoning-effort levels for *model_id*, or [] if none."""
-    model = str(model_id or "").strip()
-    if not model:
-        return []
-
-    provider = str(provider_id or "").strip().lower() if provider_id else ""
-    resolved_base_url = str(base_url or "").strip() or None
-    if not provider:
-        try:
-            _, provider, resolved_base_url = resolve_model_provider(model)
-        except Exception:
-            provider = str((cfg.get("model") or {}).get("provider") or "").strip().lower()
-
-    provider = _resolve_provider_alias(provider)
-    if provider in {"cursor-acp", "copilot-acp"}:
-        return []
-
-    hinted_model = _strip_provider_hint_for_reasoning(model)
-
-    try:
-        from hermes_cli.models import (
-            github_model_reasoning_efforts,
-            lmstudio_model_reasoning_options,
-        )
-    except Exception:
-        if provider in {"copilot", "github-copilot"}:
-            return _heuristic_reasoning_efforts(hinted_model, provider)
-    else:
-        if provider in {"copilot", "github-copilot"}:
-            return _filter_reasoning_efforts_for_provider(
-                github_model_reasoning_efforts(hinted_model), hinted_model, provider
-            )
-
-        if provider == "lmstudio":
-            probe_base = resolved_base_url or _get_provider_base_url(provider)
-            opts = lmstudio_model_reasoning_options(hinted_model, probe_base)
-            normalized = [str(opt).strip().lower() for opt in opts if str(opt).strip()]
-            if not normalized or set(normalized).issubset({"off"}):
-                return []
-            level_opts = [opt for opt in normalized if opt in VALID_REASONING_EFFORTS]
-            if level_opts:
-                return _filter_reasoning_efforts_for_provider(
-                    level_opts, hinted_model, provider
-                )
-            if set(normalized).issubset({"off", "on"}):
-                return []
-            return []
-
-    # _models_dev_reasoning_efforts already applies the provider/model filter
-    # internally, so it is returned as-is here (filtering again would be
-    # redundant — the filter is idempotent but the double pass obscures flow).
-    metadata_efforts = _models_dev_reasoning_efforts(hinted_model, provider)
-    if metadata_efforts is not None:
-        return metadata_efforts
-
-    return _heuristic_reasoning_efforts(hinted_model, provider)
-
-
-def coerce_reasoning_effort_for_model(
-    effort: str | None,
-    model_id: str | None = None,
-    provider_id: str | None = None,
-    base_url: str | None = None,
-) -> str:
-    """Return the closest supported effort for the target model/provider."""
-    raw = str(effort or "").strip().lower()
-    if not raw:
-        return ""
-    if raw == "none":
-        return "none"
-    if raw not in VALID_REASONING_EFFORTS:
-        return ""
-    supported = resolve_model_reasoning_efforts(
-        model_id,
-        provider_id=provider_id,
-        base_url=base_url,
-    )
-    # An empty list is ambiguous: resolve_model_reasoning_efforts() returns []
-    # both for models KNOWN not to support reasoning AND for models we simply
-    # don't recognize (custom providers, aggregator-rewritten ids, brand-new
-    # releases). Coercion exists to avoid sending a level a KNOWN-incompatible
-    # model rejects (e.g. openai-codex gpt-5 'max', o1/o3/o4 above 'high') —
-    # those paths return a NON-empty clamped set, so the degrade ladder below
-    # still applies. When the set is empty we can't tell "unsupported" from
-    # "unknown", so preserve the user's configured effort verbatim (the prior
-    # behavior) rather than silently disabling reasoning — the provider stays
-    # the final authority. Worst case is the same rejected request that master
-    # already produces, i.e. no regression. (#3505 review)
-    if not supported:
-        return raw
-    if raw in supported:
-        return raw
-    # Degrade to the closest *lower* supported level instead of silently
-    # disabling reasoning. e.g. max -> xhigh -> high, or xhigh -> high when the
-    # target model caps below the configured effort. Never escalate.
-    ladder = list(VALID_REASONING_EFFORTS)  # ascending: minimal..max
-    try:
-        raw_idx = ladder.index(raw)
-    except ValueError:
-        return raw
-    for level in reversed(ladder[:raw_idx]):  # strictly lower, highest first
-        if level in supported:
-            return level
-    # raw is below every supported level (shouldn't happen for a non-empty set
-    # that excludes raw, but be safe): preserve the configured effort rather
-    # than blank it.
-    return raw
-
-
-def get_reasoning_status(
-    *,
-    model_id: str | None = None,
-    provider_id: str | None = None,
-    base_url: str | None = None,
-) -> dict:
+def get_reasoning_status() -> dict:
     """Return current reasoning configuration from the active profile's
     config.yaml — the same source of truth the CLI reads from.
 
@@ -2534,30 +2067,10 @@ def get_reasoning_status(
     agent_cfg = config_data.get("agent") or {}
     show_raw = display_cfg.get("show_reasoning") if isinstance(display_cfg, dict) else None
     effort_raw = agent_cfg.get("reasoning_effort") if isinstance(agent_cfg, dict) else None
-
-    resolve_model = model_id
-    resolve_provider = provider_id
-    resolve_base_url = base_url
-    if not resolve_model:
-        model_cfg = config_data.get("model") or {}
-        if isinstance(model_cfg, dict):
-            resolve_model = str(model_cfg.get("default") or "").strip() or None
-            if not resolve_provider and model_cfg.get("provider"):
-                resolve_provider = str(model_cfg["provider"]).strip()
-            if not resolve_base_url and model_cfg.get("base_url"):
-                resolve_base_url = str(model_cfg["base_url"]).strip()
-
-    supported_efforts = resolve_model_reasoning_efforts(
-        resolve_model,
-        provider_id=resolve_provider,
-        base_url=resolve_base_url,
-    )
     return {
         # Match CLI default (True if unset in config.yaml)
         "show_reasoning": bool(show_raw) if isinstance(show_raw, bool) else True,
         "reasoning_effort": str(effort_raw or "").strip().lower(),
-        "supported_efforts": supported_efforts,
-        "supports_reasoning_effort": bool(supported_efforts),
     }
 
 
@@ -2672,116 +2185,6 @@ def set_hermes_default_model(model_id: str) -> dict:
     return {"ok": True, "model": persisted_model}
 
 
-# ── Auxiliary model configuration ──────────────────────────────────────────
-
-# Canonical auxiliary task slots. Keep in sync with hermes_cli/config.py
-# DEFAULT_CONFIG["auxiliary"] and hermes_cli/web_server.py _AUX_TASK_SLOTS.
-AUX_TASK_SLOTS: tuple[str, ...] = (
- "vision",
- "web_extract",
- "compression",
- "session_search",
- "skills_hub",
- "approval",
- "mcp",
- "title_generation",
- "curator",
-)
-
-
-def get_auxiliary_models() -> dict:
-    """Return current auxiliary task assignments from config.yaml.
-
-    Shape:
-    {
-        "tasks": [
-            {"task": "vision", "provider": "auto", "model": "", "base_url": ""},
-            ...
-        ],
-        "main": {"provider": "openrouter", "model": "anthropic/claude-opus-4.7"},
-    }
-    """
-    reload_config()
-    model_cfg = cfg.get("model", {})
-    if not isinstance(model_cfg, dict):
-        model_cfg = {}
-    main_provider = str(model_cfg.get("provider") or "").strip()
-    main_model = str(model_cfg.get("default") or model_cfg.get("name") or "").strip()
-
-    aux_cfg = cfg.get("auxiliary", {})
-    if not isinstance(aux_cfg, dict):
-        aux_cfg = {}
-
-    tasks = []
-    for slot in AUX_TASK_SLOTS:
-        entry = aux_cfg.get(slot, {})
-        if not isinstance(entry, dict):
-            entry = {}
-        tasks.append({
-            "task": slot,
-            "provider": str(entry.get("provider") or "auto").strip(),
-            "model": str(entry.get("model") or "").strip(),
-            "base_url": str(entry.get("base_url") or "").strip(),
-        })
-
-    return {
-        "tasks": tasks,
-        "main": {"provider": main_provider, "model": main_model},
-    }
-
-
-def set_auxiliary_model(task: str, provider: str, model: str) -> dict:
-    """Persist an auxiliary model assignment in config.yaml.
-
-    Special case: task='__reset__' clears all auxiliary slots.
-    """
-    if task != "__reset__" and task not in AUX_TASK_SLOTS:
-        raise ValueError(
-            f"Unknown auxiliary task slot: {task!r}. Valid: {list(AUX_TASK_SLOTS)}"
-        )
-    config_path = _get_config_path()
-    with _cfg_lock:
-        config_data = _load_yaml_config_file(config_path)
-
-        if task == "__reset__":
-            # Per-slot reset: set each slot to auto, preserving extra fields
-            # (timeout, extra_body, api_key, base_url, download_timeout, etc.)
-            aux_cfg = config_data.get("auxiliary", {})
-            if not isinstance(aux_cfg, dict):
-                aux_cfg = {}
-            for slot in AUX_TASK_SLOTS:
-                slot_cfg = aux_cfg.get(slot, {})
-                if not isinstance(slot_cfg, dict):
-                    slot_cfg = {}
-                slot_cfg["provider"] = "auto"
-                slot_cfg["model"] = ""
-                aux_cfg[slot] = slot_cfg
-            config_data["auxiliary"] = aux_cfg
-        else:
-            aux_cfg = config_data.get("auxiliary", {})
-            if not isinstance(aux_cfg, dict):
-                aux_cfg = {}
-            slot_cfg = aux_cfg.get(task, {})
-            if not isinstance(slot_cfg, dict):
-                slot_cfg = {}
-            slot_cfg["provider"] = provider or "auto"
-            slot_cfg["model"] = model or ""
-            if provider and (provider.startswith("custom:") or provider == "custom"):
-                try:
-                    _, _, resolved_base_url = resolve_model_provider(model)
-                    if resolved_base_url:
-                        slot_cfg["base_url"] = str(resolved_base_url).strip().rstrip("/")
-                except Exception:
-                    pass
-            aux_cfg[task] = slot_cfg
-            config_data["auxiliary"] = aux_cfg
-
-        _save_yaml_config_file(config_path, config_data)
-
-    reload_config()
-    return {"ok": True, "task": task, "provider": provider, "model": model}
-
-
 # ── TTL cache for get_available_models() ─────────────────────────────────────
 _available_models_cache: dict | None = None
 _available_models_cache_ts: float = 0.0
@@ -2795,7 +2198,7 @@ _cache_build_in_progress = False  # True while a cold path is actively building
 # session is expensive (~10s for zai due to endpoint probing).  The credential pool
 # only changes when the user adds/removes credentials, which is rare; a 24h TTL
 # is plenty safe and ensures get_available_models() cold paths are fast.
-_CREDENTIAL_POOL_CACHE: dict[str, tuple[float, "CredentialPool"]] = {}  # noqa: F821  forward-ref string annotation, resolved at runtime  # pid -> (ts, pool)
+_CREDENTIAL_POOL_CACHE: dict[str, tuple[float, "CredentialPool"]] = {}  # pid -> (ts, pool)
 _provider_models_invalidated_ts: dict[str, float] = {}  # provider_id -> timestamp of last invalidation
 
 # Disk-backed in-memory cache for get_available_models().
@@ -2855,7 +2258,7 @@ def _get_auth_store_path() -> Path:
 
         return _gah() / "auth.json"
     except ImportError:
-        return _DEFAULT_HERMES_HOME / "auth.json"
+        return HOME / ".hermes" / "auth.json"
 
 
 def _models_cache_file_fingerprint(path: Path) -> dict:
@@ -2909,131 +2312,11 @@ def _models_cache_catalog_fingerprint() -> dict:
     }
 
 
-# Credential-rotation fields inside auth.json that churn on a ~14-minute
-# period (credential-pool / OAuth token refresh rewrites the whole file) but
-# DO NOT change the set of available providers or models that /api/models
-# returns. mtime/size-based fingerprinting (#1699's _models_cache_file_
-# fingerprint) treats every one of these rewrites as a cache-invalidating
-# change, so the 24h models cache is effectively dead — every few minutes a
-# tab pays a full cold get_available_models() rebuild (see RCA t_d127953d /
-# t_16551f61). We strip ONLY these known-inert fields and fingerprint the
-# rest of auth.json by content, so token rotation no longer busts the cache.
-#
-# This is a DENY-list, not an allow-list, on purpose: a field we don't know
-# about stays IN the fingerprint, so any genuine change to provider
-# enablement / endpoint / api-base / model-allow (active_provider, a NEW
-# credential_pool entry id, base_url, source, label, key_source, auth_type,
-# priority, the providers{} block, …) still correctly invalidates the cache.
-# The safety invariant is one-directional: excluding these fields can only
-# ever make the fingerprint MORE stable, never make it miss a real
-# provider/model-set change — because none of these fields feed
-# detected_providers / the catalog in _build_available_models_uncached().
-_AUTH_FINGERPRINT_VOLATILE_KEYS = frozenset({
-    # Secret material — rotates on refresh, never gates the provider/model set.
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "api_key",
-    "secret",
-    "client_secret",  # rotation-only on purpose; not a model-cache differentiator
-    # Expiry / liveness — bumped every refresh, derived from the token above.
-    "expires_at",
-    "expires_at_ms",
-    "expires_in",
-    # Per-credential status/telemetry — churns on every request, not config.
-    "last_status",
-    "last_status_at",
-    "last_error_code",
-    "last_error_reason",
-    "last_error_message",
-    "last_error_reset_at",
-    "request_count",
-    # Whole-file save timestamp — rewritten on every _save_auth_store().
-    "updated_at",
-})
-
-
-def _strip_volatile_auth_fields(obj):
-    """Recursively drop credential-rotation-only keys from an auth.json tree.
-
-    Pure structural transform; never mutates the input. Any key NOT in the
-    deny-list is preserved verbatim so real provider/endpoint changes still
-    show through in the fingerprint.
-    """
-    if isinstance(obj, dict):
-        return {
-            k: _strip_volatile_auth_fields(v)
-            for k, v in obj.items()
-            if k not in _AUTH_FINGERPRINT_VOLATILE_KEYS
-        }
-    if isinstance(obj, list):
-        return [_strip_volatile_auth_fields(v) for v in obj]
-    return obj
-
-
-def _auth_store_semantic_fingerprint(path: Path) -> dict:
-    """Return a content fingerprint of auth.json that ignores token churn.
-
-    Unlike _models_cache_file_fingerprint() (mtime_ns + size), this hashes
-    the JSON content with the credential-rotation fields stripped, so the
-    ~14-min token-refresh rewrite of auth.json does NOT invalidate the 24h
-    /api/models cache. A change to anything that actually affects the
-    provider/model set (active_provider, a new credential_pool entry, a
-    changed base_url/source/label/auth_type, the providers{} block, …)
-    still changes the hash and correctly busts the cache.
-
-    Failure modes are deliberately conservative — if the file is missing we
-    record that, and if it can't be read/parsed we fall back to the old
-    mtime/size fingerprint so behaviour is never *less* safe than #1699.
-    """
-    p = Path(path).expanduser()
-    fp: dict = {"path": str(p)}
-    try:
-        st = p.stat()
-    except OSError:
-        fp["missing"] = True
-        return fp
-    try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        # Unreadable / corrupt / mid-write: fall back to the stat-based
-        # fingerprint. Strictly no less safe than the pre-fix behaviour
-        # (every write still invalidates) for this rare path only.
-        fp["mtime_ns"] = st.st_mtime_ns
-        fp["size"] = st.st_size
-        fp["semantic"] = "unparsed-fallback"
-        return fp
-    stripped = _strip_volatile_auth_fields(raw)
-    try:
-        encoded = json.dumps(
-            stripped,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            default=str,
-        ).encode("utf-8")
-        fp["semantic_sha256"] = hashlib.sha256(encoded).hexdigest()
-    except Exception:
-        fp["mtime_ns"] = st.st_mtime_ns
-        fp["size"] = st.st_size
-        fp["semantic"] = "encode-fallback"
-    return fp
-
-
 def _models_cache_source_fingerprint() -> dict:
-    """Return the current config/auth/catalog fingerprint for /api/models cache.
-
-    The auth.json axis uses a *content* fingerprint that excludes pure
-    credential-rotation fields (see _auth_store_semantic_fingerprint): the
-    auth store is rewritten roughly every 14 minutes by token refresh, and
-    a stat-based (mtime/size) fingerprint made the 24h cache churn on every
-    one of those rewrites (RCA t_16551f61). config.yaml keeps the cheap
-    mtime/size fingerprint because it is only rewritten on deliberate user
-    edits (which can change anything) and does not churn on a timer.
-    """
+    """Return the current config/auth/catalog fingerprint for /api/models cache."""
     return {
         "config_yaml": _models_cache_file_fingerprint(_get_config_path()),
-        "auth_json": _auth_store_semantic_fingerprint(_get_auth_store_path()),
+        "auth_json": _models_cache_file_fingerprint(_get_auth_store_path()),
         "catalog": _models_cache_catalog_fingerprint(),
     }
 
@@ -3244,12 +2527,6 @@ def invalidate_models_cache():
     # Also delete the disk cache so the next cold build starts fresh.
     # Disk delete is outside the lock — file I/O shouldn't block other readers.
     _delete_models_cache_on_disk()
-    try:
-        from api.plugin_providers import invalidate_plugin_model_provider_cache
-
-        invalidate_plugin_model_provider_cache()
-    except Exception:
-        pass
 
 
 def invalidate_credential_pool_cache(provider_id: str):
@@ -3315,20 +2592,17 @@ def _get_label_for_model(model_id: str, existing_groups: list) -> str:
     if lookup_id.startswith("@") and ":" in lookup_id:
         lookup_id = lookup_id.split(":", 1)[1]
 
-    # Check existing groups for a matching label.
-    # Skip slash stripping for URI-scheme IDs (e.g. gpt://folder/model) (#3429).
-    _has_scheme = lambda s: "://" in s
-    _norm = lambda s: (s.split("/", 1)[-1] if ("/" in s and not _has_scheme(s)) else s).replace("-", ".").lower()
+    # Check existing groups for a matching label
+    _norm = lambda s: (s.split("/", 1)[-1] if "/" in s else s).replace("-", ".").lower()
     norm_lookup = _norm(lookup_id)
     for g in existing_groups:
         for m in g.get("models", []):
             if m.get("label") and _norm(str(m.get("id", ""))) == norm_lookup:
                 return m["label"]
 
-    # Fall back: strip only the first slash-segment (provider prefix),
-    # preserving vendor hierarchy for multi-slash IDs (#3360).
-    # Skip for URI-scheme IDs whose slashes are path separators (#3429).
-    bare = lookup_id.split("/", 1)[1] if ("/" in lookup_id and not _has_scheme(lookup_id)) else lookup_id
+    # Fall back: capitalize each hyphen-separated word, preserve dots in version numbers.
+    # The catalog lookup above handles well-known models; this only fires for unlisted IDs.
+    bare = lookup_id.split("/")[-1] if "/" in lookup_id else lookup_id
     return " ".join(
         w.upper() if (len(w) <= 3 and w.replace(".", "").isalnum() and not w.isdigit()) else w.capitalize()
         for w in bare.replace("_", "-").split("-")
@@ -3481,18 +2755,11 @@ def get_available_models() -> dict:
             if s.startswith("@") and ":" in s:
                 parts = s.split(":")
                 s = parts[-1] or s
-            # Skip slash-based stripping for URI-scheme IDs (e.g.
-            # gpt://folder/model/latest) whose slashes are path separators,
-            # not provider delimiters (#3429).
-            if "://" not in s:
-                # Strip only the first slash-segment (provider prefix), preserving
-                # any remaining vendor hierarchy.  Using parts[-1] here previously
-                # discarded ALL segments except the last, collapsing distinct
-                # multi-slash IDs like 'vendor_a/deepseek-v4-pro' and
-                # 'vendor_b/deepseek/deepseek-v4-pro' to the same key (#3360).
-                if "/" in s:
-                    stripped = s.split("/", 1)[1]
-                    s = stripped or s
+            # Strip provider/model prefix (e.g., custom:jingdong/GLM-5 -> GLM-5).
+            # Same trailing-empty guard.
+            if "/" in s:
+                parts = s.split("/")
+                s = parts[-1] or s
             return s.replace("-", ".")
 
         def _build_configured_model_badges() -> dict[str, dict[str, str]]:
@@ -3723,7 +2990,7 @@ def get_available_models() -> dict:
 
                 hermes_env_path = _gah2() / ".env"
             except ImportError:
-                hermes_env_path = _DEFAULT_HERMES_HOME / ".env"
+                hermes_env_path = HOME / ".hermes" / ".env"
             env_keys = {}
             if hermes_env_path.exists():
                 try:
@@ -3747,7 +3014,6 @@ def get_available_models() -> dict:
                 "XIAOMI_API_KEY",
                 "OPENCODE_ZEN_API_KEY",
                 "OPENCODE_GO_API_KEY",
-                "OPENCODE_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
                 "XAI_API_KEY",
@@ -3761,12 +3027,7 @@ def get_available_models() -> dict:
             if all_env.get("ANTHROPIC_API_KEY"):
                 detected_providers.add("anthropic")
             if all_env.get("OPENAI_API_KEY"):
-                # hermes-agent registers its OPENAI_API_KEY/OPENAI_BASE_URL provider
-                # under the slug `openai-api` (there is no bare `openai` in the agent
-                # registry — only `openai-api` and `openai-codex`). Detecting `openai`
-                # here would emit `@openai:` picker entries the agent can't resolve on
-                # the send path, so detect `openai-api` to match the registry (#3443).
-                detected_providers.add("openai-api")
+                detected_providers.add("openai")
                 # openai-codex uses ChatGPT OAuth (not OPENAI_API_KEY) for its default endpoint.
                 # Detecting it here lets users who have both credentials configured find it in the
                 # picker without a manual config.yaml edit. Users without Codex OAuth will see
@@ -3794,9 +3055,9 @@ def get_available_models() -> dict:
                 detected_providers.add("x-ai")
             if all_env.get("MISTRAL_API_KEY"):
                 detected_providers.add("mistralai")
-            if all_env.get("OPENCODE_ZEN_API_KEY") or all_env.get("OPENCODE_API_KEY"):
+            if all_env.get("OPENCODE_ZEN_API_KEY"):
                 detected_providers.add("opencode-zen")
-            if all_env.get("OPENCODE_GO_API_KEY") or all_env.get("OPENCODE_API_KEY"):
+            if all_env.get("OPENCODE_GO_API_KEY"):
                 detected_providers.add("opencode-go")
             # AWS Bedrock uses IAM credentials rather than a single API key.
             # Detect when both access key and secret are available (#2720).
@@ -3839,9 +3100,7 @@ def get_available_models() -> dict:
                 # aliases; ``isinstance(_provider_cfg, dict)`` accepts custom
                 # entries that supply their own models/api_key/base_url. (#2399)
                 _is_known_provider = (
-                    _canonical in _PROVIDER_MODELS
-                    or _canonical in _PROVIDER_DISPLAY
-                    or _is_plugin_model_provider(_canonical)
+                    _canonical in _PROVIDER_MODELS or _canonical in _PROVIDER_DISPLAY
                 )
                 _is_provider_config = isinstance(_provider_cfg, dict)
                 if not (_is_known_provider or _is_provider_config):
@@ -4009,7 +3268,7 @@ def get_available_models() -> dict:
                 req.add_header("User-Agent", "OpenAI/Python 1.0")
                 for k, v in headers.items():
                     req.add_header(k, v)
-                with urllib.request.urlopen(req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as response:  # nosec B310
+                with urllib.request.urlopen(req, timeout=10) as response:  # nosec B310
                     data = json.loads(response.read().decode("utf-8"))
                 return _extract_model_entries_from_payload(data, provider), None
             except urllib.error.HTTPError as exc:
@@ -4296,7 +3555,7 @@ def get_available_models() -> dict:
                                 group["models_endpoint_error"] = _named_custom_errors[pid]
                             groups.append(group)
                     continue
-                provider_name = _effective_provider_display_name(pid, _PROVIDER_DISPLAY)
+                provider_name = _PROVIDER_DISPLAY.get(pid, pid.title())
                 if pid == "openrouter":
                     # OpenRouter has two model surfaces:
                     #   (1) curated tool-supporting catalog via hermes_cli.models.fetch_openrouter_models()
@@ -4599,11 +3858,7 @@ def get_available_models() -> dict:
                                 "models": models,
                             }
                         )
-                elif (
-                    pid in _PROVIDER_MODELS
-                    or pid in _canonical_to_raw_provider_key
-                    or _is_plugin_model_provider(pid)
-                ):
+                elif pid in _PROVIDER_MODELS or pid in _canonical_to_raw_provider_key:
                     # Look up provider_cfg using the original raw key from
                     # config.yaml so that mixed-case / underscore keys like
                     # ``CLIPpoxy`` or ``snake_case_provider`` still resolve
@@ -4893,10 +4148,8 @@ _INDEX_HTML_PATH = REPO_ROOT / "static" / "index.html"
 
 # ── Thread synchronisation ───────────────────────────────────────────────────
 LOCK = threading.Lock()
-# Max compact Session objects held in the in-memory LRU (issue #3506). Lighter
-# than the agent cache (no live agent runtime), but still bounded and operator-
-# tunable via HERMES_WEBUI_SESSIONS_MAX for installs with hundreds of sessions.
-SESSIONS_MAX = _env_int("HERMES_WEBUI_SESSIONS_MAX", 100)
+# patch-2026-05-23-memory-growth: shrink in-memory session + agent caches.
+SESSIONS_MAX = 25  # reduced from 100: each session holds messages+context_messages in RAM
 CHAT_LOCK = threading.Lock()
 
 
@@ -4913,13 +4166,8 @@ class StreamChannel:
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue] = []
         self._offline_buffer: list[tuple[str, object]] = []
-        self._last_event_id: str | None = None
 
     def subscribe(self) -> queue.Queue:
-        q, _snapshot = self.subscribe_with_snapshot()
-        return q
-
-    def subscribe_with_snapshot(self) -> tuple[queue.Queue, dict[str, object]]:
         q: queue.Queue = queue.Queue()
         with self._lock:
             # Replay buffered events to the new subscriber INSIDE the lock so a
@@ -4929,12 +4177,8 @@ class StreamChannel:
             # is safe. Per Opus advisor on stage-292.
             for item in self._offline_buffer:
                 q.put_nowait(item)
-            snapshot = {
-                "offline_buffered_events": len(self._offline_buffer),
-                "last_event_id": self._last_event_id,
-            }
             self._subscribers.append(q)
-        return q, snapshot
+        return q
 
     def unsubscribe(self, q: queue.Queue) -> None:
         with self._lock:
@@ -4943,18 +4187,8 @@ class StreamChannel:
             except ValueError:
                 pass
 
-    def note_last_event_id(self, event_id: str | None) -> None:
-        """Record the latest journal event id without changing the queue shape."""
-        if not event_id:
-            return
+    def put_nowait(self, item: tuple[str, object]) -> None:
         with self._lock:
-            self._last_event_id = event_id
-
-    def put_nowait(self, item: tuple[str, object] | tuple[str, object, str | None]) -> None:
-        event_id = item[2] if len(item) >= 3 else None
-        with self._lock:
-            if event_id:
-                self._last_event_id = event_id
             subscribers = list(self._subscribers)
             if not subscribers:
                 self._offline_buffer.append(item)
@@ -4963,7 +4197,7 @@ class StreamChannel:
         for q in subscribers:
             q.put_nowait(item)
 
-    def diagnostic_snapshot(self) -> dict[str, object]:
+    def diagnostic_snapshot(self) -> dict[str, int]:
         """Return non-sensitive stream observation counters for health checks."""
         with self._lock:
             return {
@@ -5036,12 +4270,7 @@ def unregister_active_run(stream_id: str) -> None:
 # SESSION_AGENT_CACHE_LOCK for thread safety in multi-threaded ASGI servers.
 import collections
 SESSION_AGENT_CACHE: collections.OrderedDict = collections.OrderedDict()  # LRU cache
-# Each cached agent pins a full conversation transcript in RAM, so this cap is
-# the dominant lever on WebUI resident memory (issue #3506). The default is kept
-# deliberately modest -- large/long sessions can each weigh tens of MB, so 50
-# live agents could pin >1 GB on a heavily multiplexed install. Operators can
-# tune it via HERMES_WEBUI_AGENT_CACHE_MAX without editing source.
-SESSION_AGENT_CACHE_MAX = _env_int("HERMES_WEBUI_AGENT_CACHE_MAX", 25)
+SESSION_AGENT_CACHE_MAX = 5  # reduced from 50: each agent holds full conversation history
 SESSION_AGENT_CACHE_LOCK = threading.Lock()
 
 
@@ -5063,14 +4292,11 @@ def _evict_session_agent(session_id: str) -> None:
         return
     should_close = True
     try:
-        from api.session_lifecycle import commit_session_memory, discard_session, has_uncommitted_work, unregister_agent
+        from api.session_lifecycle import commit_session_memory, has_uncommitted_work, unregister_agent
         if has_uncommitted_work(session_id):
             commit_session_memory(session_id, agent=agent, wait=True)
         if not has_uncommitted_work(session_id):
             unregister_agent(session_id)
-            # Bound the lifecycle dict: drop the entry now that the session has
-            # no uncommitted work and the agent handle is gone (issue #3506).
-            discard_session(session_id)
         else:
             should_close = False
     except Exception:
@@ -5137,18 +4363,15 @@ _SETTINGS_DEFAULTS = {
     "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "fade_text_effect": False,  # animate newly streamed words with a lightweight fade-in effect
     "show_cli_sessions": False,  # merge CLI sessions from state.db into the sidebar
-    "show_cron_sessions": False,  # surface cron sessions in the sidebar (subordinate to show_cli_sessions)
     "show_previous_messaging_sessions": False,  # show older Telegram/Discord/etc. reset segments
     "sync_to_insights": False,  # mirror WebUI token usage to state.db for /insights
     "check_for_updates": True,  # check if webui/agent repos are behind upstream
-    "ignore_agent_updates": False,  # keep WebUI update notices but suppress Agent update checks
     "whats_new_summary_enabled": False,  # show an LLM-written What's New summary before diff links
     "theme": "dark",  # light | dark | system
-    "skin": "default",  # accent color skin: default | ares | mono | graphite | slate | poseidon | sisyphus | charizard | sienna | catppuccin | nous
+    "skin": "default",  # accent color skin: default | ares | mono | slate | poseidon | sisyphus | charizard | sienna | catppuccin | nous
     "font_size": "default",  # small | default | large | xlarge
     "session_jump_buttons": False,  # show Start/End transcript jump pills
     "session_endless_scroll": False,  # auto-load older transcript pages while scrolling upward
-    "activity_feed_expanded_default": False,  # expand Activity disclosures by default for new turns
     "pinned_sessions_limit": 3,  # maximum active pinned sessions shown in the sidebar
     "inflight_state_max_sessions": 8,  # max active-stream recovery snapshots kept in browser localStorage
     "inflight_state_max_messages": 24,  # max recent messages kept per recovery snapshot
@@ -5156,7 +4379,6 @@ _SETTINGS_DEFAULTS = {
     "inflight_state_max_string_chars": 60000,  # max string length kept inside a recovery snapshot field
     "inflight_state_max_json_chars": 1500000,  # max serialized recovery snapshot payload before pruning
     "hidden_tabs": [],  # sidebar tab panel names hidden by user (e.g. ["tasks","kanban"]); chat and settings are always visible
-    "tab_order": [],  # user-defined sidebar/rail tab order for reorderable tabs; chat/settings stay fixed
     "language": "en",  # UI locale code; must match a key in static/i18n.js LOCALES
     "bot_name": os.getenv(
         "HERMES_WEBUI_BOT_NAME", "Hermes"
@@ -5166,9 +4388,7 @@ _SETTINGS_DEFAULTS = {
     "notifications_enabled": False,  # browser notification when tab is in background
     "show_thinking": True,  # show/hide thinking/reasoning blocks in chat view
     "simplified_tool_calling": True,  # render tools/thinking as compact inline timeline activity
-    "terminal_auto_expand_on_output": False,  # auto-expand terminal panel when output arrives while collapsed
     "api_redact_enabled": True,  # redact sensitive data (API keys, secrets) from API responses
-    "dashboard_plugins": {},  # plugin_name -> bool, opt-in per plugin (default off per PF-10b)
     "sidebar_density": "compact",  # compact | detailed
     "auto_title_refresh_every": "0",  # adaptive title refresh: 0=off, 5/10/20=every N exchanges
     "busy_input_mode": "queue",  # behavior when sending while agent is running: queue | interrupt | steer
@@ -5180,7 +4400,6 @@ _SETTINGS_SKIN_VALUES = {
     "default",
     "ares",
     "mono",
-    "graphite",
     "slate",
     "poseidon",
     "sisyphus",
@@ -5189,8 +4408,6 @@ _SETTINGS_SKIN_VALUES = {
     "catppuccin",
     "nous",
     "geist-contrast",
-    "zeus",
-    "verdigris",
 }
 _SETTINGS_LEGACY_THEME_MAP = {
     # Legacy full themes now map onto the closest supported theme + accent skin pair.
@@ -5305,22 +4522,18 @@ _SETTINGS_BOOL_KEYS = {
     "show_tps",
     "fade_text_effect",
     "show_cli_sessions",
-    "show_cron_sessions",
     "show_previous_messaging_sessions",
     "sync_to_insights",
     "check_for_updates",
-    "ignore_agent_updates",
     "whats_new_summary_enabled",
     "sound_enabled",
     "rtl",
     "notifications_enabled",
     "show_thinking",
     "simplified_tool_calling",
-    "terminal_auto_expand_on_output",
     "api_redact_enabled",
     "session_jump_buttons",
     "session_endless_scroll",
-    "activity_feed_expanded_default",
 }
 # Language codes are validated as short alphanumeric BCP-47-like tags (e.g. 'en', 'zh', 'fr')
 _SETTINGS_LANG_RE = __import__("re").compile(r"^[a-zA-Z]{2,10}(-[a-zA-Z0-9]{2,8})?$")
@@ -5346,19 +4559,7 @@ def save_settings(settings: dict) -> dict:
     if settings.pop("_clear_password", False):
         current["password_hash"] = None
         _password_changed = True
-    # Deep-merge dashboard_plugins dict (plugin_name -> bool)
-    _dashboard_plugins = settings.get("dashboard_plugins")
-    if isinstance(_dashboard_plugins, dict):
-        current_dash = current.get("dashboard_plugins", {})
-        if isinstance(current_dash, dict):
-            # Coerce values to bool + keep only str keys so settings.json can't be
-            # polluted with non-bool/non-str junk from a crafted POST.
-            current_dash.update({k: bool(v) for k, v in _dashboard_plugins.items() if isinstance(k, str)})
-            current["dashboard_plugins"] = current_dash
     for k, v in settings.items():
-        # dashboard_plugins is deep-merged above (not a flat allowlisted scalar).
-        if k == "dashboard_plugins":
-            continue
         if k in _SETTINGS_ALLOWED_KEYS:
             if k == "theme":
                 if isinstance(v, str) and v.strip():
@@ -5387,23 +4588,18 @@ def save_settings(settings: dict) -> dict:
                 not isinstance(v, str) or not _SETTINGS_LANG_RE.match(v)
             ):
                 continue
-            # Validate list-valued sidebar tab settings. Chat/settings stay fixed
-            # even if a tampered POST tries to persist them, and duplicates are
-            # collapsed while preserving the first requested order.
-            if k in {"hidden_tabs", "tab_order"}:
+            # Validate hidden_tabs: must be a list of non-empty strings.
+            # Belt-and-suspenders strip of "chat" and "settings" so a
+            # malicious POST cannot lock the user out of the always-visible
+            # nav tabs even though the client also filters them at apply time.
+            # Stage-394 follow-up to #2636 deep review.
+            if k == "hidden_tabs":
                 if not isinstance(v, list):
                     continue
-                seen = set()
-                cleaned = []
-                for s in v:
-                    if not isinstance(s, str):
-                        continue
-                    s = s.strip()
-                    if not s or s in {"chat", "settings"} or s in seen:
-                        continue
-                    seen.add(s)
-                    cleaned.append(s)
-                v = cleaned
+                v = [
+                    s for s in v
+                    if isinstance(s, str) and s.strip() and s not in {"chat", "settings"}
+                ]
             # Coerce bool keys
             if k in _SETTINGS_BOOL_KEYS:
                 v = bool(v)

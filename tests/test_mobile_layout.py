@@ -665,11 +665,6 @@ def test_100dvh_viewport_height():
         "style.css must use 100dvh for correct mobile viewport height (100vh hides content under address bar)"
 
 
-def test_viewport_disables_page_zoom_for_native_pwa_shell():
-    """Installed PWA launches should not rubber-band into browser-style page zoom."""
-    assert 'name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"' in HTML
-
-
 def test_pwa_safe_area_top_stays_scoped_to_installed_modes():
     """The PWA shell should not opt into cover-mode geometry for every browser surface."""
     assert 'viewport-fit=cover' not in HTML
@@ -681,11 +676,7 @@ def test_pwa_safe_area_top_stays_scoped_to_installed_modes():
 
 def test_titlebar_safe_area_top_uses_scoped_variable():
     """The titlebar must use the safe-area variable instead of direct env()."""
-    # Match the GLOBAL `.app-titlebar{...}` rule, not skin-scoped variants like
-    # `:root.dark[data-skin="neon"] .app-titlebar{...}` (#3164) which can appear
-    # earlier in the file. Require the selector to start the line (optionally
-    # indented) with no `[data-skin=` scope prefix.
-    m = re.search(r'(?m)^\s*\.app-titlebar\{(?P<body>[^}]*)\}', CSS)
+    m = re.search(r'\.app-titlebar\{(?P<body>[^}]*)\}', CSS)
     assert m, ".app-titlebar rule missing from style.css"
     rule = m.group("body")
     assert "padding-top:var(--app-titlebar-safe-top)" in rule, (
@@ -708,20 +699,6 @@ def test_safe_area_variables_available_for_pwa_shell():
     assert "padding:8px 10px 12px!important" in CSS, (
         "Phone composer should keep the proven pre-cover-mode padding contract"
     )
-
-
-def test_pwa_startup_classes_have_native_shell_affordances():
-    """The JS-startup fallback classes should mirror browser display-mode CSS.
-
-    iOS and embedded webviews do not always evaluate display-mode media queries
-    the same way as Chromium. pwa-startup.js adds classes early, so CSS should
-    provide the same native-feel affordances through those classes.
-    """
-    assert ".pwa-standalone" in CSS
-    assert ".pwa-standalone .app-titlebar-reload" in CSS
-    assert "overscroll-behavior:none" in CSS
-    assert ".pwa-offline .app-titlebar::after" in CSS
-    assert "pwa-title-resume" in CSS
 
 
 def test_composer_touch_target_size():
@@ -1114,21 +1091,13 @@ def test_mobile_composer_primary_controls_keep_touch_friendly_sizing():
     assert ctx_wrap.get("display") == "none!important", \
         "context indicator must not add a late-appearing composer-right slot on phones"
 
-    # #3062 replaced the old text badge (composerMobileCtxBadge / .composer-mobile-ctx-badge)
-    # with an SVG context-usage ring overlaid on the config button. The invariant is the
-    # same: the ring is a visual indicator hosted ON the 44px config button (whose sizing is
-    # asserted above), and it must not steal/shrink that touch target. The ring SVG is
-    # aria-hidden and uses currentColor; it carries no pointer events of its own.
-    assert 'id="composerMobileCtxRing"' in HTML, \
-        "mobile context-usage ring element must exist in the composer config button"
-    assert 'id="composerMobileCtxBadge"' not in HTML, \
-        "old text badge should be fully replaced by the ring, not left dangling"
-    # Locate the ring's markup and confirm it does not become an interactive/sized control
-    # that would compete with the config button's 44px target.
-    _ring_idx = HTML.find('id="composerMobileCtxRing"')
-    _ring_tag = HTML[HTML.rfind("<", 0, _ring_idx):HTML.find(">", _ring_idx) + 1]
-    assert "aria-hidden" in _ring_tag, \
-        "the context ring is decorative overlay — it must be aria-hidden so it doesn't steal the config button's role/touch target"
+    ctx_badge = _declarations(_rule_body(CSS, ".composer-mobile-ctx-badge"))
+    assert ctx_badge.get("position") == "absolute", \
+        "mobile context usage should be shown as a badge on the config button, not a separate slot"
+    assert ctx_badge.get("pointer-events") == "none", \
+        "mobile context badge must not shrink or steal the config button touch target"
+    assert 'id="composerMobileCtxBadge"' in HTML, \
+        "mobile context badge element must exist in the composer config button"
 
     icon_btn = _declarations(_rule_body(mobile_css, ".icon-btn"))
     assert icon_btn.get("min-width") == "44px", \

@@ -53,10 +53,7 @@ def test_live_metering_usage_is_provisional_until_done():
     assert listener_end != -1, "apperror listener should follow metering listener"
     listener = MESSAGES_JS[listener_start:listener_end]
 
-    assert "_mergeUsageForCtxIndicator(d.usage,S.lastUsage||{})" in listener, (
-        "live usage should merge through the context indicator usage guard"
-    )
-    assert ": {...(S.lastUsage||{}),...d.usage}" in listener, (
+    assert "S.lastUsage={...(S.lastUsage||{}),...d.usage}" in listener, (
         "live usage should update the transient usage cache for the indicator"
     )
     assert "_syncCtxIndicator(S.lastUsage)" in listener, (

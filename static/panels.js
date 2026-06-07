@@ -58,9 +58,7 @@ function syncAppTitlebar() {
     mainText = S.session.title || (typeof t === 'function' ? t('untitled') : 'Untitled');
     const vis = Array.isArray(S.messages) ? S.messages.filter(m => m && m.role && m.role !== 'tool') : [];
     if (typeof t === 'function') subText = t('n_messages', vis.length);
-    sourceLabel = S.session.source_label || S.session.source_tag || S.session.raw_source || '';
-    // Recovered sidecars stamp source_label 'WebUI' (api/session_recovery.py); don't badge a native session as its own source (#3338).
-    if (/^webui$/i.test(sourceLabel)) sourceLabel = '';
+    if (S.session.is_cli_session) sourceLabel = S.session.source_label || S.session.source_tag || S.session.raw_source || '';
   } else {
     const key = APP_TITLEBAR_KEYS[panel];
     mainText = key && typeof t === 'function' ? t(key) : (panel.charAt(0).toUpperCase() + panel.slice(1));
@@ -245,7 +243,7 @@ async function switchPanel(name, opts = {}) {
   // showing-<name> class on <main>; no class means chat (the default).
   const mainEl = document.querySelector('main.main');
   if (mainEl) {
-    ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs','plugin'].forEach(p => {
+    ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs'].forEach(p => {
       mainEl.classList.toggle('showing-' + p, nextPanel === p);
     });
   }
@@ -430,66 +428,9 @@ function _cronDiagnostics(job) {
   return JSON.stringify(fields, null, 2);
 }
 
-function _gatewayStatusReason(status) {
-  const health = status && typeof status.health === 'object' ? status.health : null;
-  if (!health) return '';
-  return typeof health.reason === 'string' ? health.reason.trim() : '';
-}
-
-function _cronGatewayNoticeHtml(status) {
-  if (!status || (status.configured && status.running)) return '';
-  const reason = _gatewayStatusReason(status);
-  const isStaleMetadata = reason === 'gateway_stale_running_state';
-  const isRemoteUnreachable = reason === 'remote_gateway_unreachable';
-  const notConfigured = !status.configured;
-  const title = notConfigured
-    ? 'Gateway not configured'
-    : isStaleMetadata
-      ? 'Gateway metadata stale'
-      : isRemoteUnreachable
-        ? 'Gateway endpoint not reachable'
-        : 'Gateway not running';
-  const body = notConfigured
-    ? 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon. If this is a single-container Docker install, jobs can be created and run manually here, but scheduled ticks need a gateway container or `hermes gateway` running outside the WebUI.'
-    : isStaleMetadata
-      ? 'The gateway is marked as configured, but its health metadata has gone stale. In Docker, scheduled jobs require a live gateway daemon that refreshes runtime metadata while ticking cron.'
-      : isRemoteUnreachable
-        ? 'The gateway health endpoint is not reachable from WebUI. Verify the configured gateway URL env var (`GATEWAY_HEALTH_URL`, `HERMES_GATEWAY_HEALTH_URL`, `HERMES_API_URL`, or `HERMES_WEBUI_GATEWAY_BASE_URL`) points to a reachable gateway service and network path before relying on cron ticking.'
-        : 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon to be running. Start the gateway container or `hermes gateway` before relying on offline scheduled runs.';
-  const docsHref = 'https://github.com/nesquena/hermes-webui/blob/master/docs/docker.md#scheduled-jobs-and-the-gateway-daemon';
-  const helpLink = notConfigured || isRemoteUnreachable || isStaleMetadata
-    ? `<p><a href="${docsHref}" target="_blank" rel="noopener">How to enable scheduled jobs in Docker ↗</a></p>`
-    : '';
-  return `
-    <div class="detail-alert-title">${esc(title)}</div>
-    <p>${esc(body)}</p>
-    ${helpLink}
-  `;
-}
-
-async function loadCronGatewayNotice() {
-  const box = $('cronGatewayNotice');
-  if (!box) return;
-  try {
-    const status = await api('/api/gateway/status');
-    const html = _cronGatewayNoticeHtml(status);
-    if (html) {
-      box.innerHTML = html;
-      box.style.display = '';
-    } else {
-      box.innerHTML = '';
-      box.style.display = 'none';
-    }
-  } catch (_) {
-    box.innerHTML = '';
-    box.style.display = 'none';
-  }
-}
-
 async function loadCrons(animate) {
   const box = $('cronList');
   const refreshBtn = $('cronRefreshBtn');
-  loadCronGatewayNotice();
   if (animate && refreshBtn) {
     refreshBtn.style.opacity = '0.5';
     refreshBtn.disabled = true;
@@ -725,20 +666,9 @@ async function _loadRunContent(jobId, filename, runId){
   const body = document.querySelector(`#${runId} .detail-run-body`);
   if (!body) return;
   const item = document.getElementById(runId);
-  if (item.classList.contains('open')) {
-    // Already open → collapse and return (toggle behaviour)
-    item.classList.remove('open');
-    body.classList.remove('expanded');
-    _cronExpansionSet(_cronRunExpandKey(jobId, filename), false);
-    const btn = item ? item.querySelector('.detail-expand-toggle') : null;
-    if (btn) {
-      btn.textContent = '▾';
-      btn.title = (t('cron_expand_output') || 'Expand output');
-      btn.setAttribute('aria-label', btn.title);
-    }
-    return;
+  if (!item.classList.contains('open')) {
+    item.classList.add('open');
   }
-  item.classList.add('open');
   body.classList.toggle('expanded', _cronExpansionGet(_cronRunExpandKey(jobId, filename)));
   body.innerHTML = `<span style="opacity:.5">${esc(t('loading'))}</span>`;
   try {
@@ -877,7 +807,6 @@ let _cronSelectedSkills=[];
 let _cronIsDuplicate = false;
 let _cronSkillsCache=null;
 let _cronProfilesCache=null;
-let _cronDeliveryOptionsCache=null;
 
 function openCronCreate(){
   if (typeof switchPanel === 'function' && _currentPanel !== 'tasks') switchPanel('tasks');
@@ -925,6 +854,7 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
   const isNoAgent = !!no_agent;
   const toastNotifications = toast_notifications !== false;
   title.textContent = isEdit ? (t('edit') + ' · ' + (name || schedule || t('scheduled_jobs'))) : t('new_job');
+  const deliverOpt = (v,l) => `<option value="${v}"${deliver===v?' selected':''}>${esc(l)}</option>`;
   body.innerHTML = `
     <div class="main-view-content">
       <form class="detail-form" onsubmit="event.preventDefault(); saveCronForm();">
@@ -945,8 +875,11 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
         </div>
         <div class="detail-form-row">
           <label for="cronFormDeliver">${esc(t('cron_deliver_label') || 'Deliver output to')}</label>
-          <select id="cronFormDeliver">
-            <option value="" disabled>loading...</option>
+          <select id="cronFormDeliver" ${isEdit ? 'disabled' : ''}>
+            ${deliverOpt('local', t('cron_deliver_local') || 'Local (save output only)')}
+            ${deliverOpt('discord','Discord')}
+            ${deliverOpt('telegram','Telegram')}
+            ${deliverOpt('slack','Slack')}
           </select>
         </div>
         <div class="detail-form-row">
@@ -978,7 +911,6 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
   body.style.display = '';
   if (empty) empty.style.display = 'none';
   _setCronHeaderButtons(isEdit ? 'edit' : 'create');
-  _populateCronDeliverOptions(deliver, isEdit);
   _renderCronSkillTags();
   const scheduleEl = $('cronFormSchedule');
   if (scheduleEl) {
@@ -988,37 +920,6 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
   }
   const focusEl = $('cronFormName');
   if (focusEl) focusEl.focus();
-}
-
-async function _populateCronDeliverOptions(selectedValue, isEdit) {
-  var sel = $('cronFormDeliver');
-  if (!sel) return;
-  sel.disabled = true;
-  try {
-    if (!_cronDeliveryOptionsCache) {
-      var res = await api('/api/crons/delivery-options');
-      _cronDeliveryOptionsCache = res && res.platforms ? res.platforms : [];
-    }
-    sel.innerHTML = '';
-    for (var i = 0; i < _cronDeliveryOptionsCache.length; i++) {
-      var p = _cronDeliveryOptionsCache[i];
-      var opt = document.createElement('option');
-      opt.value = p.value;
-      opt.textContent = p.label;
-      if (p.value === selectedValue) opt.selected = true;
-      sel.appendChild(opt);
-    }
-    if (selectedValue && !sel.querySelector('option[value="' + CSS.escape(selectedValue) + '"]')) {
-      var opt = document.createElement('option');
-      opt.value = selectedValue;
-      opt.textContent = selectedValue + ' *';
-      opt.selected = true;
-      sel.prepend(opt);
-    }
-  } catch (e) {
-    sel.innerHTML = '<option value="local">Local (save output only)</option>';
-  }
-  sel.disabled = false;
 }
 
 function _renderCronSkillTags(){
@@ -1104,7 +1005,6 @@ async function saveCronForm(){
       const updates = {job_id: _editingCronId, schedule, profile: profile, toast_notifications: toastNotifications};
       if (!isNoAgent) updates.prompt = prompt;
       if (name) updates.name = name;
-      if (deliver) updates.deliver = deliver;
       await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
       const editedId = _editingCronId;
       _editingCronId = null;
@@ -1175,7 +1075,7 @@ function _startCronWatch(jobId) {
   _cronWatchStart = Date.now();
   _cronWatchInterval = setInterval(async () => {
     try {
-      const data = await api(`/api/crons/status?job_id=${encodeURIComponent(jobId)}`,{timeoutToast:false});
+      const data = await api(`/api/crons/status?job_id=${encodeURIComponent(jobId)}`);
       if (!data.running) {
         _stopCronWatch();
         if (_currentCronDetail && _currentCronDetail.id === jobId) {
@@ -1230,7 +1130,7 @@ function _formatElapsed(seconds) {
 
 function _checkCronWatchOnDetail(jobId) {
   // When opening a detail view, check if job is running
-  api(`/api/crons/status?job_id=${encodeURIComponent(jobId)}`,{timeoutToast:false}).then(data => {
+  api(`/api/crons/status?job_id=${encodeURIComponent(jobId)}`).then(data => {
     if (data.running && _currentCronDetail && _currentCronDetail.id === jobId) {
       _startCronWatch(jobId);
     }
@@ -1339,188 +1239,17 @@ function _kanbanRenderSidebar(columns){
 }
 
 
-/**
- * Render inline markdown (bold, italic, code, links, strikethrough).
- * Input is already HTML-escaped.
- */
 function _kanbanRenderMarkdownInline(escaped){
   return String(escaped || '')
-    .replace(/~~([^~\n]+)~~/g, (_m, text) => `<del>${text}</del>`)
     .replace(/`([^`\n]+)`/g, (_m, code) => `<code>${code}</code>`)
     .replace(/\*\*([^*\n]+)\*\*/g, (_m, text) => `<strong>${text}</strong>`)
-    .replace(/(^|[^*a-zA-Z0-9])\*([^*\n]+)\*/g, (_m, prefix, text) => `${prefix}<em>${text}</em>`)
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, (_m, prefix, text) => `${prefix}<em>${text}</em>`)
     .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g, (_m, text, href) => `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`);
 }
 
-/**
- * Render full markdown block content: headings, code blocks, lists, tables,
- * task lists, blockquotes, horizontal rules, paragraphs + inline formatting.
- */
 function _kanbanRenderMarkdown(source){
   if (!source) return '';
-  const lines = esc(source).split(/\r?\n/);
-  const out = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    // ── Code block ──
-    if (/^```/.test(trimmed)) {
-      const lang = trimmed.slice(3).trim();
-      const codeLines = [];
-      i++;
-      while (i < lines.length && !/^```/.test(lines[i].trim())) {
-        codeLines.push(lines[i]);
-        i++;
-      }
-      i++; // skip closing ```
-      const codeHtml = codeLines.join('\n');
-      out.push(lang
-        ? `<pre class="hermes-kanban-code"><code class="language-${_kanbanRenderMarkdownInline(lang)}">${codeHtml}</code></pre>`
-        : `<pre class="hermes-kanban-code"><code>${codeHtml}</code></pre>`);
-      continue;
-    }
-
-    // ── Horizontal rule ──
-    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(trimmed)) {
-      out.push('<hr>');
-      i++;
-      continue;
-    }
-
-    // ── Heading ──
-    const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
-    if (headingMatch) {
-      const level = headingMatch[1].length;
-      out.push(`<h${level}>${_kanbanRenderMarkdownInline(headingMatch[2])}</h${level}>`);
-      i++;
-      continue;
-    }
-
-    // ── Blockquote ──
-    if (/^>\s?/.test(trimmed)) {
-      const quoteLines = [];
-      while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
-        quoteLines.push(lines[i].trim().replace(/^>\s?/, ''));
-        i++;
-      }
-      out.push(`<blockquote>${_kanbanRenderMarkdownInline(quoteLines.join('<br>'))}</blockquote>`);
-      continue;
-    }
-
-    // ── Table row ──
-    if (/^\|.+\|$/.test(trimmed)) {
-      const tableRows = [];
-      const tableAligns = [];
-      while (i < lines.length && /^\|.+\|$/.test(lines[i].trim())) {
-        const row = lines[i].trim();
-        // Detect alignment separator row
-        if (/^\|[\s:]*-{3,}[\s:]*\|/.test(row)) {
-          const cells = row.split('|').filter(c => c.trim().length > 0);
-          cells.forEach(c => {
-            const t = c.trim();
-            if (t.startsWith(':') && t.endsWith(':')) tableAligns.push('center');
-            else if (t.endsWith(':')) tableAligns.push('right');
-            else tableAligns.push('left');
-          });
-        } else {
-          const cells = row.split('|').filter(c => c.trim().length > 0);
-          tableRows.push(cells.map((c, ci) => {
-            const align = tableAligns[ci] ? ` style="text-align:${tableAligns[ci]}"` : '';
-            return `<td${align}>${_kanbanRenderMarkdownInline(c.trim())}</td>`;
-          }).join(''));
-        }
-        i++;
-      }
-      if (tableRows.length) {
-        out.push(`<table><tbody>${tableRows.map(r => `<tr>${r}</tr>`).join('')}</tbody></table>`);
-      }
-      continue;
-    }
-
-    // ── Task list item ──
-    const taskMatch = trimmed.match(/^[-*+]\s+\[( |x|X)\]\s+(.+)$/);
-    if (taskMatch) {
-      const checked = taskMatch[1] !== ' ';
-      const text = taskMatch[2];
-      const items = [];
-      items.push(`<li class="hermes-kanban-task${checked ? ' checked' : ''}"><input type="checkbox"${checked ? ' checked' : ''} disabled> ${_kanbanRenderMarkdownInline(text)}</li>`);
-      i++;
-      // Collect continuation items
-      while (i < lines.length) {
-        const next = lines[i].trim();
-        const nextTask = next.match(/^[-*+]\s+\[( |x|X)\]\s+(.+)$/);
-        const nextLi = next.match(/^[-*+]\s+(.+)$/);
-        if (nextTask) {
-          const c = nextTask[1] !== ' ';
-          items.push(`<li class="hermes-kanban-task${c ? ' checked' : ''}"><input type="checkbox"${c ? ' checked' : ''} disabled> ${_kanbanRenderMarkdownInline(nextTask[2])}</li>`);
-          i++;
-        } else if (nextLi) {
-          items.push(`<li>${_kanbanRenderMarkdownInline(nextLi[1])}</li>`);
-          i++;
-        } else {
-          break;
-        }
-      }
-      out.push(`<ul>${items.join('')}</ul>`);
-      continue;
-    }
-
-    // ── Unordered list item ──
-    const ulMatch = trimmed.match(/^[-*+]\s+(.+)$/);
-    if (ulMatch) {
-      const items = [];
-      items.push(`<li>${_kanbanRenderMarkdownInline(ulMatch[1])}</li>`);
-      i++;
-      while (i < lines.length) {
-        const next = lines[i].trim();
-        const nextUl = next.match(/^[-*+]\s+(.+)$/);
-        const nextTask = next.match(/^[-*+]\s+\[( |x|X)\]\s+(.+)$/);
-        if (nextTask) break; // let task list handler get it
-        if (nextUl) {
-          items.push(`<li>${_kanbanRenderMarkdownInline(nextUl[1])}</li>`);
-          i++;
-        } else {
-          break;
-        }
-      }
-      out.push(`<ul>${items.join('')}</ul>`);
-      continue;
-    }
-
-    // ── Ordered list item ──
-    const olMatch = trimmed.match(/^\d+\.\s+(.+)$/);
-    if (olMatch) {
-      const items = [];
-      items.push(`<li>${_kanbanRenderMarkdownInline(olMatch[1])}</li>`);
-      i++;
-      while (i < lines.length) {
-        const next = lines[i].trim();
-        const nextOl = next.match(/^\d+\.\s+(.+)$/);
-        if (nextOl) {
-          items.push(`<li>${_kanbanRenderMarkdownInline(nextOl[1])}</li>`);
-          i++;
-        } else {
-          break;
-        }
-      }
-      out.push(`<ol>${items.join('')}</ol>`);
-      continue;
-    }
-
-    // ── Empty line ──
-    if (!trimmed) {
-      out.push('');
-      i++;
-      continue;
-    }
-
-    // ── Paragraph ──
-    out.push(`<p>${_kanbanRenderMarkdownInline(trimmed)}</p>`);
-    i++;
-  }
-  return `<div class="hermes-kanban-md">${out.join('\n')}</div>`;
+  return `<div class="hermes-kanban-md">${esc(source).split(/\r?\n/).map(line => line.trim() ? `<p>${_kanbanRenderMarkdownInline(line)}</p>` : '').join('')}</div>`;
 }
 
 function _kanbanFormatDuration(seconds){
@@ -2087,7 +1816,7 @@ function _kanbanCommentHtml(comment){
   const by = comment.author || comment.created_by || comment.actor || '';
   const at = _kanbanFormatTimestamp(comment.created_at || comment.ts || '');
   return `<div class="kanban-detail-row">
-    <div class="kanban-detail-row-main">${_kanbanRenderMarkdown(body)}</div>
+    <div class="kanban-detail-row-main">${esc(body)}</div>
     <div class="kanban-detail-row-meta">${esc([by, at].filter(Boolean).join(' · '))}</div>
   </div>`;
 }
@@ -2639,7 +2368,7 @@ function _kanbanRenderTaskDetail(data){
       <div class="kanban-task-preview-title">${esc(title)}</div>
       <button class="btn secondary kanban-edit-btn" onclick="openKanbanEdit('${esc(task.id)}')" data-i18n="kanban_edit_task" title="${esc(t('kanban_edit_task') || 'Edit task')}">${esc(t('kanban_edit_task') || 'Edit task')}</button>
     </div>
-    <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
+    <div class="kanban-task-preview-body">${esc(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     <div class="kanban-status-actions">${statusButtons}</div>
     <div class="kanban-detail-grid">
@@ -2659,7 +2388,8 @@ async function loadKanbanTask(taskId){
   if (!taskId) return;
   try {
     const data = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + _kanbanBoardQuery());
-    try { data.log = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery({tail: 65536})); } catch(e) { data.log = {}; }
+    const logEndpoint = '/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery();
+    try { data.log = await api(logEndpoint + '?tail=65536'); } catch(e) { data.log = {}; }
     _kanbanCurrentTaskId = taskId;
     const task = data.task || {};
     const title = _kanbanTaskTitle(task);
@@ -2677,86 +2407,38 @@ async function loadKanbanTask(taskId){
   } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
-// Phase 2: Single-source-of-truth render.
-//
-// Reads `S.todos` (set by the `todo_state` SSE listener, INFLIGHT
-// restore, or session cold-load — see _hydrateTodosFromSession in
-// ui.js).  When `S.todoStateMeta` is null we have never seen an
-// explicit signal and fall through to the legacy reverse-scan over
-// settled tool messages — this keeps the panel populated against
-// pre-Phase-1 servers and during the upgrade window.
-//
-// The render is short-circuited via `_todosLastRenderedHash` (defined
-// in ui.js): repeated emissions that yield identical DOM are no-ops.
-// Coalescing of bursty live updates happens upstream in
-// scheduleTodosRefresh().
 function loadTodos() {
   const panel = $('todoPanel');
   if (!panel) return;
-
-  let todos;
-  if (S.todoStateMeta) {
-    todos = Array.isArray(S.todos) ? S.todos : [];
-  } else {
-    todos = _legacyTodosFromMessages();
-  }
-
-  if (!todos.length) {
-    if (typeof _todosLastRenderedHash !== 'undefined' && _todosLastRenderedHash === '__empty__') return;
-    panel.innerHTML = `<div style="color:var(--muted);font-size:12px;padding:4px 0">${esc(t('todos_no_active'))}</div>`;
-    if (typeof _todosLastRenderedHash !== 'undefined') _todosLastRenderedHash = '__empty__';
-    return;
-  }
-
-  if (typeof _todosHash === 'function' && typeof _todosLastRenderedHash !== 'undefined') {
-    const hash = _todosHash(todos);
-    if (hash === _todosLastRenderedHash) return;
-    _todosLastRenderedHash = hash;
-  }
-
-  const statusIcon = {pending:li('square',14), in_progress:li('loader',14), completed:li('check',14), cancelled:li('x',14)};
-  const statusColor = {pending:'var(--muted)', in_progress:'var(--blue)', completed:'rgba(100,200,100,.8)', cancelled:'rgba(200,100,100,.5)'};
-  // Single innerHTML join is the cheapest correct way to materialize
-  // ~10–50 leaf nodes.  All user-controlled content goes through esc().
-  panel.innerHTML = todos.map(td => `
-    <div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);">
-      <span style="font-size:14px;display:inline-flex;align-items:center;flex-shrink:0;margin-top:1px;color:${statusColor[td.status]||'var(--muted)'}">${statusIcon[td.status]||li('square',14)}</span>
-      <div style="flex:1;min-width:0">
-        <div style="font-size:13px;color:${td.status==='completed'?'var(--muted)':td.status==='in_progress'?'var(--text)':'var(--text)'};${td.status==='completed'?'text-decoration:line-through;opacity:.5':''};line-height:1.4">${esc(td.content)}</div>
-        <div style="font-size:10px;color:var(--muted);margin-top:2px;opacity:.6">${esc(td.id)} · ${esc(td.status)}</div>
-      </div>
-    </div>`).join('');
-}
-
-// Legacy fallback: reverse-scan settled tool messages for the most
-// recent {"todos":[...]} payload.  Used only when no `todo_state`
-// signal has been seen for the current session — primarily during
-// upgrade windows where the server has not yet been redeployed with
-// Phase 1.  Once Phase 1 is universally deployed and a stabilization
-// period has passed, this can be removed (Phase 3).
-//
-// Variable name `sourceMessages` is preserved verbatim from the
-// original loadTodos() implementation so the matching regression
-// test (R-todo-survive-refresh in tests/test_regressions.py) keeps
-// catching any future refactor that drops the raw-session-messages
-// fallback. See the test for the exact contract.
-function _legacyTodosFromMessages() {
   const sourceMessages = (S.session && Array.isArray(S.session.messages) && S.session.messages.length) ? S.session.messages : S.messages;
-  if (!Array.isArray(sourceMessages)) return [];
+  // Parse the most recent todo state from message history
+  let todos = [];
   for (let i = sourceMessages.length - 1; i >= 0; i--) {
     const m = sourceMessages[i];
-    if (!m || m.role !== 'tool') continue;
-    let content = m.content;
-    if (typeof content !== 'string') {
-      try { content = JSON.stringify(content); } catch (_) { continue; }
+    if (m && m.role === 'tool') {
+      try {
+        const d = JSON.parse(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
+        if (d && Array.isArray(d.todos) && d.todos.length) {
+          todos = d.todos;
+          break;
+        }
+      } catch(e) {}
     }
-    if (!content || content.indexOf('"todos"') < 0) continue;
-    try {
-      const d = JSON.parse(content);
-      if (d && Array.isArray(d.todos)) return d.todos;
-    } catch (_) {}
   }
-  return [];
+  if (!todos.length) {
+    panel.innerHTML = `<div style="color:var(--muted);font-size:12px;padding:4px 0">${esc(t('todos_no_active'))}</div>`;
+    return;
+  }
+  const statusIcon = {pending:li('square',14), in_progress:li('loader',14), completed:li('check',14), cancelled:li('x',14)};
+  const statusColor = {pending:'var(--muted)', in_progress:'var(--blue)', completed:'rgba(100,200,100,.8)', cancelled:'rgba(200,100,100,.5)'};
+  panel.innerHTML = todos.map(t => `
+    <div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);">
+      <span style="font-size:14px;display:inline-flex;align-items:center;flex-shrink:0;margin-top:1px;color:${statusColor[t.status]||'var(--muted)'}">${statusIcon[t.status]||li('square',14)}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;color:${t.status==='completed'?'var(--muted)':t.status==='in_progress'?'var(--text)':'var(--text)'};${t.status==='completed'?'text-decoration:line-through;opacity:.5':''};line-height:1.4">${esc(t.content)}</div>
+        <div style="font-size:10px;color:var(--muted);margin-top:2px;opacity:.6">${esc(t.id)} · ${esc(t.status)}</div>
+      </div>
+    </div>`).join('');
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -3281,12 +2963,11 @@ async function loadInsights(animate) {
   }
   const period = ($('insightsPeriod') || {}).value || '30';
   try {
-    const [data, wikiStatus, skillUsage] = await Promise.all([
+    const [data, wikiStatus] = await Promise.all([
       api(`/api/insights?days=${period}`),
       api('/api/wiki/status').catch(err => ({status:'error', error: err.message || String(err)})),
-      api('/api/skills/usage').catch(() => ({usage:{}, skill_names:[], total_invocations:0, unique_skills_used:0})),
     ]);
-    _renderInsights(data, box, wikiStatus, skillUsage);
+    _renderInsights(data, box, wikiStatus);
     if (typeof _syncSystemHealthMonitorVisibility === 'function') _syncSystemHealthMonitorVisibility();
     if (typeof pollSystemHealth === 'function') void pollSystemHealth();
   } catch(e) {
@@ -3439,26 +3120,7 @@ function _bucketDailyTokensForChart(rows) {
   return result;
 }
 
-function _renderSkillUsage(d) {
-  const usage = d.usage || {};
-  const skillNames = d.skill_names || [];
-  const totalInvocations = d.total_invocations || 0;
-  const uniqueUsed = d.unique_skills_used || 0;
-  const entries = Object.entries(usage)
-    .map(([name, meta]) => [name, Number(meta && meta.use_count) || 0, Number(meta && meta.view_count) || 0, Number(meta && meta.patch_count) || 0])
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10);
-  if (!entries.length) {
-    return `<div class="insights-card" id="skillUsageCard"><div class="insights-card-title">${esc(t('insights_skill_usage_title'))}</div><div class="insights-empty">${esc(t('insights_skill_usage_no_data'))}</div><div style="font-size:11px;color:var(--muted);margin-top:4px">${esc(t('insights_skill_usage_no_data_hint'))}</div></div>`;
-  }
-  const rows = entries.map(([name, useCount, viewCount, patchCount]) => {
-    const share = totalInvocations > 0 ? (useCount / totalInvocations * 100).toFixed(1) : '0.0';
-    return `<div class="insights-table-row"><span class="insights-model-name" title="${esc(name)}">${esc(name)}</span><span>${useCount}</span><span>${viewCount}</span><span>${patchCount}</span><span>${share}%</span></div>`;
-  }).join('');
-  return `<div class="insights-card" id="skillUsageCard"><div class="insights-card-title">${esc(t('insights_skill_usage_title'))}</div><div class="skill-usage-grid" style="margin-bottom:8px"><div><span>${esc(t('insights_skill_usage_total'))}</span><strong>${totalInvocations.toLocaleString()}</strong></div><div><span>${esc(t('insights_skill_usage_skills_used'))}</span><strong>${uniqueUsed}/${skillNames.length}</strong></div></div><div class="insights-table skill-usage-table"><div class="insights-table-head"><span>${esc(t('insights_skill_usage_col_skill'))}</span><span>${esc(t('insights_skill_usage_col_uses'))}</span><span>${esc(t('insights_skill_usage_col_views'))}</span><span>${esc(t('insights_skill_usage_col_patches'))}</span><span>${esc(t('insights_skill_usage_col_share'))}</span></div>${rows}</div><div class="wiki-status-footer" style="margin-top:8px">${esc(t('insights_skill_usage_footer'))}</div></div>`;
-}
-
-function _renderInsights(d, box, wikiStatus, skillUsage) {
+function _renderInsights(d, box, wikiStatus) {
   const fmtNum = n => Number(n || 0).toLocaleString();
   const fmtCost = c => {
     const value = Number(c || 0);
@@ -3562,7 +3224,6 @@ function _renderInsights(d, box, wikiStatus, skillUsage) {
   box.innerHTML = `
     ${_renderSystemHealthPanel()}
     ${_renderLlmWikiStatus(wikiStatus)}
-    ${_renderSkillUsage(skillUsage)}
     <div class="insights-grid">
       ${overviewCards.map(c => `<div class="insights-stat"><div class="insights-stat-icon">${c.icon}</div><div class="insights-stat-info"><div class="insights-stat-value">${c.value}</div><div class="insights-stat-label">${esc(c.label)}</div></div></div>`).join('')}
     </div>
@@ -3718,19 +3379,6 @@ function _stripYamlFrontmatter(content) {
   return { frontmatter: m[1], body: content.slice(m[0].length) };
 }
 
-function _skillMarkdownHtml(markdown) {
-  return `<div class="preview-md">${renderMd(markdown || '')}</div>`;
-}
-
-function _enhanceSkillMarkdown(root) {
-  if (!root) return;
-  requestAnimationFrame(() => {
-    const mdRoot = root.querySelector('.preview-md') || root;
-    if (typeof highlightCode === 'function') highlightCode(mdRoot);
-    if (typeof renderKatexBlocks === 'function') renderKatexBlocks(mdRoot);
-  });
-}
-
 function _renderSkillDetail(name, content, linkedFiles) {
   const title = $('skillDetailTitle');
   const body = $('skillDetailBody');
@@ -3743,7 +3391,7 @@ function _renderSkillDetail(name, content, linkedFiles) {
   if (frontmatter) {
     html += `<details class="skill-frontmatter"><summary>${esc(t('skill_metadata'))}</summary><pre><code>${esc(frontmatter)}</code></pre></details>`;
   }
-  html += _skillMarkdownHtml(markdownBody || '(no content)');
+  html += renderMd(markdownBody || '(no content)');
   const lf = linkedFiles || {};
   const categories = Object.entries(lf).filter(([,files]) => files && files.length > 0);
   if (categories.length) {
@@ -3758,7 +3406,6 @@ function _renderSkillDetail(name, content, linkedFiles) {
     html += '</div>';
   }
   body.innerHTML = `<div class="main-view-content skill-detail-content">${html}</div>`;
-  _enhanceSkillMarkdown(body);
   body.querySelectorAll('.skill-linked-file').forEach(a => {
     a.addEventListener('click', e => { e.preventDefault(); openSkillFile(a.dataset.skillName, a.dataset.skillFile); });
   });
@@ -3830,7 +3477,7 @@ async function openSkillFile(skillName, filePath) {
     const header = `<div class="skill-file-breadcrumb"><a href="#" class="skill-file-back" data-skill-name="${esc(skillName)}">&larr; ${esc(backLabel)}</a><span class="skill-file-path">${esc(filePath)}</span></div>`;
     let content;
     if (isMd) {
-      content = `<div class="main-view-content">${_skillMarkdownHtml(data.content || '')}</div>`;
+      content = `<div class="main-view-content">${renderMd(data.content || '')}</div>`;
     } else {
       const escaped = esc(data.content || '');
       content = `<pre class="skill-file-code"><code>${escaped}</code></pre>`;
@@ -3849,8 +3496,7 @@ async function openSkillFile(skillName, filePath) {
         }
       });
     });
-    if (isMd) _enhanceSkillMarkdown(body);
-    else requestAnimationFrame(() => { if (typeof highlightCode === 'function') highlightCode(); });
+    if (!isMd) requestAnimationFrame(() => { if (typeof highlightCode === 'function') highlightCode(); });
   } catch(e) { setStatus(t('skill_file_load_failed') + e.message); }
 }
 
@@ -4003,20 +3649,13 @@ async function deleteCurrentSkill() {
 
 // ── Memory (main view) ──
 let _memoryData = null;
-let _notesSourcesData = null;
-let _notesSearchResults = [];
-let _notesSelectedSource = 'joplin';
-let _notesPreviewNote = null;
-let _notesSearchError = '';
-let _notesSearchLoading = false;
-let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'external_notes'
+let _currentMemorySection = null; // 'memory' | 'user' | 'soul'
 let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
 
 const MEMORY_SECTIONS = [
   { key: 'memory', labelKey: 'my_notes', emptyKey: 'no_notes_yet', iconKey: 'brain' },
   { key: 'user',   labelKey: 'user_profile', emptyKey: 'no_profile_yet', iconKey: 'user' },
   { key: 'soul',   labelKey: 'agent_soul', emptyKey: 'no_soul_yet', iconKey: 'sparkles' },
-  { key: 'external_notes', labelKey: 'external_notes_sources', emptyKey: 'external_notes_empty', iconKey: 'book-open' },
 ];
 
 function _memorySectionMeta(key) {
@@ -4043,84 +3682,12 @@ function _setMemoryHeaderButtons(mode) {
   const editBtn = $('btnEditMemoryDetail');
   const cancelBtn = $('btnCancelMemoryDetail');
   const saveBtn = $('btnSaveMemoryDetail');
-  if (mode === 'read' && _currentMemorySection !== 'external_notes') { show(editBtn); hide(cancelBtn); hide(saveBtn); }
+  if (mode === 'read') { show(editBtn); hide(cancelBtn); hide(saveBtn); }
   else if (mode === 'edit') { hide(editBtn); show(cancelBtn); show(saveBtn); }
   else { hide(editBtn); hide(cancelBtn); hide(saveBtn); }
 }
 
-function _renderExternalNotesSources() {
-  const title = $('memoryDetailTitle');
-  const body = $('memoryDetailBody');
-  const empty = $('memoryDetailEmpty');
-  if (!title || !body) return;
-  title.textContent = t('external_notes_sources');
-  const data = _notesSourcesData || {};
-  const sources = Array.isArray(data.sources) ? data.sources : [];
-  const recall = data.automatic_recall_unchanged !== false
-    ? `<div class="memory-detail-mtime">${esc(t('external_notes_auto_recall_hint'))}</div>`
-    : '';
-  if (!sources.length) {
-    body.innerHTML = `<div class="main-view-content">${recall}<div class="memory-empty">${esc(t('external_notes_empty'))}</div></div>`;
-  } else {
-    const selected = sources.find(src => (src.name || '').toLowerCase() === (_notesSelectedSource || '').toLowerCase()) || sources[0];
-    _notesSelectedSource = (selected && selected.name) || 'joplin';
-    const sourceOptions = sources.map(src => `<option value="${esc(src.name||'')}" ${src.name===_notesSelectedSource?'selected':''}>${esc(src.label||src.name||'')}</option>`).join('');
-    const recentAiNotes = Array.isArray(data.recent_ai_notes) ? data.recent_ai_notes : [];
-    const recentAiHtml = recentAiNotes.length
-      ? `<section class="notes-source-card notes-ai-recent-card">
-          <div class="notes-source-card-head notes-ai-recent-head"><strong>${li('bot', 14)}${esc(t('external_notes_recent_ai'))}</strong><span class="detail-badge">${esc(t('external_notes_auto'))}</span></div>
-          <div class="notes-ai-recent-list">${recentAiNotes.map(note => {
-            const updated = note.updated_time ? new Date(Number(note.updated_time)).toLocaleString() : '';
-            return `<button type="button" class="notes-result-card notes-ai-recent-item" onclick="previewExternalNote('${esc(note.source||'joplin')}','${esc(note.id||'')}')"><strong>${esc(note.title||note.label||'Untitled')}</strong><span>${li('clock', 14)}${esc(note.label||t('external_notes_recent_ai_reason'))}${updated ? ` · ${esc(updated)}` : ''}</span></button>`;
-          }).join('')}</div>
-        </section>`
-      : '';
-    const searchError = _notesSearchError ? `<div class="detail-form-error">${esc(_notesSearchError)}</div>` : '';
-    const resultHtml = _notesSearchResults.length
-      ? `<div class="notes-search-results">${_notesSearchResults.map(note => `<button type="button" class="notes-result-card" onclick="previewExternalNote('${esc(note.source||_notesSelectedSource)}','${esc(note.id||'')}')"><strong>${esc(note.title||'Untitled')}</strong>${note.snippet?`<span>${esc(note.snippet)}</span>`:''}</button>`).join('')}</div>`
-      : `<div class="memory-empty">${esc(t('external_notes_search_empty'))}</div>`;
-    const previewHtml = _notesPreviewNote
-      ? `<section class="notes-source-card notes-preview-card"><div class="notes-source-card-head"><strong>${esc(_notesPreviewNote.title||'Untitled')}</strong><span class="detail-badge">${esc(_notesPreviewNote.source||_notesSelectedSource)}</span></div><div class="memory-content preview-md">${renderMd(_notesPreviewNote.body||'')}</div></section>`
-      : '';
-    const cards = sources.map(src => {
-      const status = src.active ? t('source_active') : (src.status || t('source_configured'));
-      const tools = Array.isArray(src.tools) ? src.tools : [];
-      const hintHtml = src.tool_source === 'configured_hint'
-        ? `<div class="memory-detail-mtime">${esc(t('external_notes_configured_hint'))}</div>`
-        : '';
-      const toolHtml = tools.length
-        ? `<ul class="notes-source-tools">${tools.map(tool => `<li><strong>${esc(tool.name||'')}</strong>${tool.description?` — ${esc(tool.description)}`:''}</li>`).join('')}</ul>`
-        : `<div class="memory-empty">${esc(t('external_notes_no_tools'))}</div>`;
-      return `<section class="notes-source-card">
-        <div class="notes-source-card-head"><strong>${esc(src.label||src.name||'')}</strong><span class="detail-badge ${src.active?'active':''}">${esc(status)}</span></div>
-        <div class="memory-detail-mtime">${esc(t('external_notes_tool_count', src.tool_count||0))}</div>
-        ${hintHtml}
-        ${toolHtml}
-      </section>`;
-    }).join('');
-    const searchUi = `<section class="notes-source-card notes-search-card">
-      <form class="notes-search-form" onsubmit="event.preventDefault(); searchExternalNotes();">
-        <select id="externalNotesSource" onchange="selectExternalNotesSource(this.value)">${sourceOptions}</select>
-        <input id="externalNotesQuery" type="search" placeholder="${esc(t('external_notes_search_placeholder'))}" />
-        <button type="submit" class="btn-secondary">${esc(_notesSearchLoading ? t('loading') : t('search'))}</button>
-      </form>
-      ${searchError}
-      ${resultHtml}
-    </section>`;
-    body.innerHTML = `<div class="main-view-content">${recall}${recentAiHtml}${searchUi}${previewHtml}${cards}</div>`;
-  }
-  body.style.display = '';
-  if (empty) empty.style.display = 'none';
-  _memoryMode = 'read';
-  _setMemoryHeaderButtons('read');
-}
-
 function _renderMemoryDetail(section) {
-  if (section === 'external_notes') {
-    _renderExternalNotesSources();
-    return;
-  }
-
   const meta = _memorySectionMeta(section);
   const title = $('memoryDetailTitle');
   const body = $('memoryDetailBody');
@@ -4167,78 +3734,15 @@ function _renderMemoryEdit(section) {
   if (ta) ta.focus();
 }
 
-async function loadNotesSources(force) {
-  if (_notesSourcesData && !force) return _notesSourcesData;
-  try {
-    _notesSourcesData = await api('/api/notes/sources');
-  } catch (e) {
-    _notesSourcesData = {sources: [], automatic_recall_unchanged: true, error: e && e.message ? e.message : String(e)};
-  }
-  return _notesSourcesData;
-}
-
-function selectExternalNotesSource(source) {
-  _notesSelectedSource = source || 'joplin';
-  _notesSearchResults = [];
-  _notesPreviewNote = null;
-  _notesSearchError = '';
-  _renderExternalNotesSources();
-}
-
-async function searchExternalNotes() {
-  const input = $('externalNotesQuery');
-  const sourceEl = $('externalNotesSource');
-  const q = input ? input.value.trim() : '';
-  _notesSelectedSource = sourceEl ? sourceEl.value : (_notesSelectedSource || 'joplin');
-  _notesPreviewNote = null;
-  _notesSearchError = '';
-  if (!q) {
-    _notesSearchResults = [];
-    _renderExternalNotesSources();
-    return;
-  }
-  _notesSearchLoading = true;
-  _renderExternalNotesSources();
-  try {
-    const data = await api(`/api/notes/search?source=${encodeURIComponent(_notesSelectedSource)}&q=${encodeURIComponent(q)}&limit=20`);
-    _notesSearchResults = Array.isArray(data.results) ? data.results : [];
-    _notesSearchError = data.error || '';
-  } catch (e) {
-    _notesSearchResults = [];
-    _notesSearchError = e && e.message ? e.message : String(e);
-  } finally {
-    _notesSearchLoading = false;
-    _renderExternalNotesSources();
-    const nextInput = $('externalNotesQuery');
-    if (nextInput) nextInput.value = q;
-  }
-}
-
-async function previewExternalNote(source, id) {
-  _notesSearchError = '';
-  try {
-    const data = await api(`/api/notes/item?source=${encodeURIComponent(source||_notesSelectedSource)}&id=${encodeURIComponent(id||'')}`);
-    _notesPreviewNote = data && data.note ? data.note : null;
-  } catch (e) {
-    _notesPreviewNote = null;
-    _notesSearchError = e && e.message ? e.message : String(e);
-  }
-  _renderExternalNotesSources();
-}
-
-async function openMemorySection(section, el) {
-  if (section === 'external_notes' && _memoryData && !_memoryData.external_notes_enabled) return;
+function openMemorySection(section, el) {
   _currentMemorySection = section;
   document.querySelectorAll('#memoryPanel .side-menu-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
-  if (section === 'external_notes') {
-    await loadNotesSources(false);
-  }
   _renderMemoryDetail(section);
 }
 
 function editCurrentMemory() {
-  if (!_currentMemorySection || _currentMemorySection === 'external_notes') return;
+  if (!_currentMemorySection) return;
   _renderMemoryEdit(_currentMemorySection);
 }
 
@@ -4405,10 +3909,8 @@ function syncWorkspaceDisplays(){
 async function loadWorkspaceList(){
   try{
     const data = await api('/api/workspaces');
-    if(typeof syncTerminalBackendState==='function') syncTerminalBackendState(data);
     _workspaceList = data.workspaces || [];
     syncWorkspaceDisplays();
-    if(typeof syncTerminalButton==='function') syncTerminalButton();
     return data;
   }catch(e){ return {workspaces:[], last:''}; }
 }
@@ -5074,11 +4576,7 @@ function _refreshProfileSwitchBackground(gen){
     if (gen !== _profileSwitchGeneration) return;
     var hidden = (s && Array.isArray(s.hidden_tabs)) ? s.hidden_tabs : [];
     hidden = hidden.filter(function(x){ return typeof x === 'string' && x.trim(); });
-    var order = (s && Array.isArray(s.tab_order)) ? s.tab_order : [];
-    order = order.filter(function(x){ return typeof x === 'string' && x.trim(); });
     if (typeof _setHiddenTabs === 'function') _setHiddenTabs(hidden);
-    if (typeof _setTabOrder === 'function') _setTabOrder(order);
-    if (typeof _applyTabOrder === 'function') _applyTabOrder(order);
     if (typeof _applyTabVisibility === 'function') _applyTabVisibility(hidden);
   }).catch(function(){});
 }
@@ -5119,18 +4617,17 @@ async function loadProfilesPanel() {
       const meta = [];
       if (p.model) meta.push(p.model.split('/').pop());
       if (p.provider) meta.push(p.provider);
-      if (p.total_skills && p.total_skills > 0) meta.push(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`));
+      if (p.skill_count) meta.push(t('profile_skill_count', p.skill_count));
       const gwDot = p.gateway_running
         ? `<span class="profile-opt-badge running" title="${esc(t('profile_gateway_running'))}"></span>`
         : `<span class="profile-opt-badge stopped" title="${esc(t('profile_gateway_stopped'))}"></span>`;
       const isActive = p.name === activeName;
       const activeBadge = isActive ? `<span style="color:var(--link);font-size:10px;font-weight:600;margin-left:6px">${esc(t('profile_active'))}</span>` : '';
       const defaultBadge = p.is_default ? ` <span style="opacity:.5">${esc(t('profile_default_label'))}</span>` : '';
-      const hiddenBadge = p.visible === false ? ' <span class="detail-badge" title="Hidden from chat">Hidden from chat</span>' : '';
       card.innerHTML = `
         <div class="profile-card-header">
           <div style="min-width:0;flex:1">
-            <div class="profile-card-name${isActive ? ' is-active' : ''}">${gwDot}${esc(p.name)}${defaultBadge}${activeBadge}${hiddenBadge}</div>
+            <div class="profile-card-name${isActive ? ' is-active' : ''}">${gwDot}${esc(p.name)}${defaultBadge}${activeBadge}</div>
             ${meta.length ? `<div class="profile-card-meta">${esc(meta.join(' \u00b7 '))}</div>` : `<div class="profile-card-meta">${esc(t('profile_no_configuration'))}</div>`}
           </div>
         </div>`;
@@ -5194,7 +4691,7 @@ function _renderProfileDetail(p, activeName){
   if (p.provider) rows.push(`<div class="detail-row"><div class="detail-row-label">Provider</div><div class="detail-row-value">${esc(p.provider)}</div></div>`);
   if (p.base_url) rows.push(`<div class="detail-row"><div class="detail-row-label">Base URL</div><div class="detail-row-value"><code>${esc(p.base_url)}</code></div></div>`);
   rows.push(`<div class="detail-row"><div class="detail-row-label">API key</div><div class="detail-row-value">${p.has_env ? esc(t('profile_api_keys_configured')) : '<span style="color:var(--muted)">Not configured</span>'}</div></div>`);
-  if (p.total_skills && p.total_skills > 0) rows.push(`<div class="detail-row"><div class="detail-row-label">Skills</div><div class="detail-row-value">${esc(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`))}</div></div>`);
+  if (typeof p.skill_count === 'number') rows.push(`<div class="detail-row"><div class="detail-row-label">Skills</div><div class="detail-row-value">${esc(t('profile_skill_count', p.skill_count))}</div></div>`);
   if (p.default_workspace) rows.push(`<div class="detail-row"><div class="detail-row-label">Default space</div><div class="detail-row-value"><code>${esc(p.default_workspace)}</code></div></div>`);
   body.innerHTML = `
     <div class="main-view-content">
@@ -5275,17 +4772,16 @@ function renderProfileDropdown(data) {
   const dd = $('profileDropdown');
   if (!dd) return;
   dd.innerHTML = '';
-  const allProfiles = data.profiles || [];
-  const active = (S.activeProfile && allProfiles.some(p => p.name === S.activeProfile))
+  const profiles = data.profiles || [];
+  const active = (S.activeProfile && profiles.some(p => p.name === S.activeProfile))
     ? S.activeProfile
     : (data.active || 'default');
-  const profiles = allProfiles.filter(p => p && (p.visible !== false || p.name === active));
   for (const p of profiles) {
     const opt = document.createElement('div');
     opt.className = 'profile-opt' + (p.name === active ? ' active' : '');
     const meta = [];
     if (p.model) meta.push(p.model.split('/').pop());
-    if (p.total_skills && p.total_skills > 0) meta.push(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`));
+    if (p.skill_count) meta.push(t('profile_skill_count', p.skill_count));
     const gwDot = `<span class="profile-opt-badge ${p.gateway_running ? 'running' : 'stopped'}"></span>`;
     const checkmark = p.name === active ? ' <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--link)" stroke-width="3" style="vertical-align:-1px"><polyline points="20 6 9 17 4 12"/></svg>' : '';
     const defaultBadge = p.is_default ? ` <span style="opacity:.5;font-weight:400">${esc(t('profile_default_label'))}</span>` : '';
@@ -5364,7 +4860,6 @@ async function switchToProfile(name) {
     const data = await api('/api/profile/switch', { method: 'POST', body: JSON.stringify({ name }) });
     if (_switchGen !== _profileSwitchGeneration) return;
     S.activeProfile = data.active || name;
-    S.activeProfileIsDefault = !!data.is_default;
 
     // Update composer placeholder and title bar while the core profile-switch
     // state is still close to the profile API response.
@@ -5409,17 +4904,7 @@ async function switchToProfile(name) {
       if (S.session && !sessionInProgress) {
         S.session.model = modelToUse;
         S.session.model_provider = modelState.model_provider||providerId||null;
-        S.session.profile = data.active || name;
       }
-    }
-    // #3331 follow-up (Codex gate): retag the in-memory session's profile on
-    // ANY profile switch, even when the switched-to profile returns no
-    // default_model (empty session / model-less profile). Without this the
-    // profile chip + project-picker filter keep the stale profile after a
-    // switch to a model-less profile. Guarded by !sessionInProgress like the
-    // model patch above (don't touch a session about to be replaced).
-    if (S.session && !sessionInProgress) {
-      S.session.profile = data.active || name;
     }
 
     // ── Apply workspace ────────────────────────────────────────────────────
@@ -5638,16 +5123,9 @@ async function loadMemory(force) {
   try {
     const data = await api('/api/memory');
     _memoryData = data;
-    if (_currentMemorySection === 'external_notes' && !data.external_notes_enabled) {
-      _currentMemorySection = null;
-    }
-    if (_currentMemorySection === 'external_notes') {
-      await loadNotesSources(!!force);
-    }
     if (panel) {
       panel.innerHTML = '';
       for (const s of MEMORY_SECTIONS) {
-        if (s.key === 'external_notes' && !_memoryData.external_notes_enabled) continue;
         const el = document.createElement('button');
         el.type = 'button';
         el.className = 'side-menu-item';
@@ -5668,18 +5146,7 @@ async function loadMemory(force) {
 // Drag and drop
 const wrap=$('composerWrap');let dragCounter=0;
 document.addEventListener('dragover',e=>e.preventDefault());
-document.addEventListener('dragenter',e=>{e.preventDefault();
-  const isWsPath=e.dataTransfer.types.includes('application/ws-path');
-  const isFiles=e.dataTransfer.types.includes('Files');
-  if(isFiles||isWsPath){
-    dragCounter++;
-    // Context-aware hint: a workspace-file drag inserts an @path reference;
-    // an OS-file drag attaches the file to the message.
-    const hint=$('dropHintText');
-    if(hint) hint.textContent=isWsPath?'Drop to insert workspace reference':'Drop files to attach';
-    wrap.classList.add('drag-over');
-  }
-});
+document.addEventListener('dragenter',e=>{e.preventDefault();if(e.dataTransfer.types.includes('Files')||e.dataTransfer.types.includes('application/ws-path')){dragCounter++;wrap.classList.add('drag-over');}});
 document.addEventListener('dragleave',e=>{dragCounter--;if(dragCounter<=0){dragCounter=0;wrap.classList.remove('drag-over');}});
 document.addEventListener('drop',e=>{
   e.preventDefault();dragCounter=0;wrap.classList.remove('drag-over');
@@ -5717,84 +5184,21 @@ let _settingsAppearanceAutosaveRetryPayload = null;
 let _settingsPreferencesAutosaveTimer = null;
 let _settingsPreferencesAutosaveRetryPayload = null;
 
-// ── Sidebar tab visibility/order ────────────────────────────────────────────
+// ── Sidebar tab visibility ─────────────────────────────────────────────────
 const _ALWAYS_VISIBLE_TABS = new Set(['chat','settings']);
 const _HIDDEN_TABS_LS_KEY = 'hermes-webui-hidden-tabs';
-const _TAB_ORDER_LS_KEY = 'hermes-webui-tab-order';
-let _tabVisibilityDragSuppressUntil = 0;
-
-function _sanitizeTabPanelList(panels){
-  if(!Array.isArray(panels)) return [];
-  var out=[];
-  panels.forEach(function(panel){
-    if(typeof panel!=='string') return;
-    panel=panel.trim();
-    if(!panel||_ALWAYS_VISIBLE_TABS.has(panel)) return;
-    if(out.indexOf(panel)===-1) out.push(panel);
-  });
-  return out;
-}
 
 function _getHiddenTabs(){
-  try{var h=localStorage.getItem(_HIDDEN_TABS_LS_KEY);if(h)return _sanitizeTabPanelList(JSON.parse(h));}catch(e){}
+  try{var h=localStorage.getItem(_HIDDEN_TABS_LS_KEY);if(h){var p=JSON.parse(h);if(Array.isArray(p))return p;}}catch(e){}
   return[];
 }
 
 function _setHiddenTabs(panels){
-  try{localStorage.setItem(_HIDDEN_TABS_LS_KEY,JSON.stringify(_sanitizeTabPanelList(panels)));}catch(e){}
-}
-
-function _getTabOrder(){
-  try{var h=localStorage.getItem(_TAB_ORDER_LS_KEY);if(h)return _sanitizeTabPanelList(JSON.parse(h));}catch(e){}
-  return[];
-}
-
-function _setTabOrder(panels){
-  try{localStorage.setItem(_TAB_ORDER_LS_KEY,JSON.stringify(_sanitizeTabPanelList(panels)));}catch(e){}
-}
-
-function _availableSidebarPanels(){
-  var out=[];
-  var tabs=document.querySelectorAll('.rail .rail-btn.nav-tab[data-panel], .sidebar-nav .nav-tab[data-panel]');
-  tabs.forEach(function(tab){
-    var panel=tab.dataset.panel;
-    if(!panel||_ALWAYS_VISIBLE_TABS.has(panel)) return;
-    if(tab.classList.contains('dashboard-link')||tab.hasAttribute('data-dashboard-link')) return;
-    if(out.indexOf(panel)===-1) out.push(panel);
-  });
-  return out;
-}
-
-function _orderedSidebarPanels(order){
-  var available=_availableSidebarPanels();
-  var requested=_sanitizeTabPanelList(Array.isArray(order)?order:_getTabOrder());
-  var out=[];
-  requested.forEach(function(panel){ if(available.indexOf(panel)!==-1&&out.indexOf(panel)===-1) out.push(panel); });
-  available.forEach(function(panel){ if(out.indexOf(panel)===-1) out.push(panel); });
-  return out;
-}
-
-function _applyTabOrder(order){
-  var ordered=_orderedSidebarPanels(order);
-  ['.rail','.sidebar-nav'].forEach(function(selector){
-    var container=document.querySelector(selector);
-    if(!container) return;
-    var anchor=Array.prototype.find.call(container.children,function(child){
-      if(child.classList&&child.classList.contains('rail-spacer')) return true;
-      if(child.classList&&child.classList.contains('dashboard-link')) return true;
-      if(child.hasAttribute&&child.hasAttribute('data-dashboard-link')) return true;
-      return child.dataset&&child.dataset.panel==='settings';
-    });
-    ordered.forEach(function(panel){
-      var node=container.querySelector('.nav-tab[data-panel="'+panel+'"]');
-      if(node) container.insertBefore(node,anchor||null);
-    });
-  });
+  try{localStorage.setItem(_HIDDEN_TABS_LS_KEY,JSON.stringify(panels));}catch(e){}
 }
 
 function _applyTabVisibility(hidden){
-  hidden=_sanitizeTabPanelList(hidden);
-  _applyTabOrder(_getTabOrder());
+  if(!Array.isArray(hidden)) hidden=[];
   // Hide/unhide all [data-panel] elements (sidebar-nav buttons + rail buttons)
   document.querySelectorAll('[data-panel]').forEach(function(el){
     var panel=el.dataset.panel;
@@ -5817,12 +5221,14 @@ function _renderTabVisibilityChips(){
   var container=$('tabVisibilityChips');
   if(!container)return;
   var hidden=_getHiddenTabs();
-  var panels=_orderedSidebarPanels();
+  // Scan rail buttons to discover all available panels (skip always-visible + dashboard-link)
+  var tabs=document.querySelectorAll('.rail .rail-btn.nav-tab[data-panel]');
   container.innerHTML='';
-  panels.forEach(function(panel){
-    var tab=document.querySelector('.rail .rail-btn.nav-tab[data-panel="'+panel+'"]')
-      ||document.querySelector('.sidebar-nav .nav-tab[data-panel="'+panel+'"]');
-    var label=(tab&&(tab.dataset.tooltip||tab.dataset.label))||panel;
+  tabs.forEach(function(tab){
+    var panel=tab.dataset.panel;
+    if(!panel||_ALWAYS_VISIBLE_TABS.has(panel))return;
+    if(tab.classList.contains('dashboard-link'))return;
+    var label=tab.dataset.tooltip||tab.dataset.label||panel;
     // Capitalize first letter
     label=label.charAt(0).toUpperCase()+label.slice(1);
     var chip=document.createElement('button');
@@ -5832,57 +5238,15 @@ function _renderTabVisibilityChips(){
     if(isOff)chip.classList.add('chip-off');
     chip.textContent=label;
     chip.setAttribute('data-tab-panel',panel);
-    chip.setAttribute('draggable','true');
     // Use role="switch" + aria-checked instead of aria-pressed so screen
     // readers narrate "Tasks switch on/off" (matches user mental model) rather
     // than "Tasks toggle button pressed/not-pressed" (where the polarity is
     // confusing because chip-off looks like the "off" state).
     chip.setAttribute('role','switch');
     chip.setAttribute('aria-checked',isOff?'false':'true');
-    chip.onclick=function(){
-      if(Date.now()<_tabVisibilityDragSuppressUntil)return;
-      _toggleTabVisibilityChip(panel);
-    };
-    _wireTabChipDrag(chip,panel);
+    chip.onclick=function(){_toggleTabVisibilityChip(panel);};
     container.appendChild(chip);
   });
-}
-
-function _wireTabChipDrag(chip,panel){
-  if(!chip)return;
-  chip.addEventListener('dragstart',function(e){
-    chip.classList.add('dragging');
-    if(e.dataTransfer){
-      e.dataTransfer.effectAllowed='move';
-      e.dataTransfer.setData('text/plain',panel);
-    }
-  });
-  chip.addEventListener('dragend',function(){chip.classList.remove('dragging');});
-  chip.addEventListener('dragover',function(e){e.preventDefault();chip.classList.add('drag-over');if(e.dataTransfer)e.dataTransfer.dropEffect='move';});
-  chip.addEventListener('dragleave',function(){chip.classList.remove('drag-over');});
-  chip.addEventListener('drop',function(e){_handleTabVisibilityChipDrop(e,panel);});
-}
-
-function _moveTabOrderPanel(sourcePanel,targetPanel){
-  if(!sourcePanel||!targetPanel||sourcePanel===targetPanel) return false;
-  var order=_orderedSidebarPanels();
-  var from=order.indexOf(sourcePanel);
-  var to=order.indexOf(targetPanel);
-  if(from===-1||to===-1) return false;
-  order.splice(from,1);
-  order.splice(to,0,sourcePanel);
-  _setTabOrder(order);
-  _applyTabOrder(order);
-  _renderTabVisibilityChips();
-  _scheduleAppearanceAutosave();
-  return true;
-}
-
-function _handleTabVisibilityChipDrop(e,targetPanel){
-  if(e){e.preventDefault();e.stopPropagation();}
-  document.querySelectorAll('.tab-visibility-chip.drag-over').forEach(function(el){el.classList.remove('drag-over');});
-  var sourcePanel=e&&e.dataTransfer?e.dataTransfer.getData('text/plain'):'';
-  if(_moveTabOrderPanel(sourcePanel,targetPanel)) _tabVisibilityDragSuppressUntil=Date.now()+250;
 }
 
 function _toggleTabVisibilityChip(panel){
@@ -5901,26 +5265,7 @@ function _toggleTabVisibilityChip(panel){
 }
 
 function switchSettingsSection(name){
-  // If the main content is not showing settings, switch back first
-  if (_currentPanel !== 'settings') {
-    _currentPanel = 'settings';
-    var mainEl = document.querySelector('main.main');
-    if (mainEl) {
-      ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs','plugin'].forEach(function(p) {
-        mainEl.classList.toggle('showing-' + p, p === 'settings');
-      });
-    }
-  }
-  let section=(name==='appearance'||name==='preferences'||name==='providers'||name==='plugins'||name==='system')?name:'conversation';
-  // Deep-linking to the Plugins pane when the tab is hidden (no plugins
-  // installed, #3457) falls back to Conversation. Resolve this BEFORE toggling
-  // panes/sidebar/dropdown below so every downstream selection uses the
-  // corrected section — otherwise the plugins pane would still render active
-  // but empty. (#3457)
-  if(section==='plugins'){
-    const pluginsTabBtn=document.querySelector('[data-settings-section="plugins"]');
-    if(pluginsTabBtn && pluginsTabBtn.style.display==='none') section='conversation';
-  }
+  const section=(name==='appearance'||name==='preferences'||name==='providers'||name==='plugins'||name==='system')?name:'conversation';
   _settingsSection=section;
   _currentSettingsSection=section;
   const map={conversation:'Conversation',appearance:'Appearance',preferences:'Preferences',providers:'Providers',plugins:'Plugins',system:'System'};
@@ -6046,9 +5391,7 @@ function _appearancePayloadFromUi(){
     font_size: ($('settingsFontSize')||{}).value || localStorage.getItem('hermes-font-size') || 'default',
     session_jump_buttons: !!($('settingsSessionJumpButtons')||{}).checked,
     session_endless_scroll: !!($('settingsSessionEndlessScroll')||{}).checked,
-    activity_feed_expanded_default: !!($('settingsActivityFeedExpandedDefault')||{}).checked,
     hidden_tabs: _getHiddenTabs(),
-    tab_order: _getTabOrder(),
   };
 }
 
@@ -6101,9 +5444,6 @@ async function _autosaveAppearanceSettings(payload){
       if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
     }
     window._sessionEndlessScrollEnabled=!!(saved&&saved.session_endless_scroll);
-    if(saved&&Object.prototype.hasOwnProperty.call(saved,'activity_feed_expanded_default')){
-      window._activityFeedExpandedDefault=!!saved.activity_feed_expanded_default;
-    }
     _setAppearanceAutosaveStatus('saved');
   }catch(e){
     console.warn('[settings] appearance autosave failed', e);
@@ -6137,25 +5477,16 @@ function _preferencesPayloadFromUi(){
   if(fadeTextCb) payload.fade_text_effect=fadeTextCb.checked;
   const simplifiedToolCb=$('settingsSimplifiedToolCalling');
   if(simplifiedToolCb) payload.simplified_tool_calling=simplifiedToolCb.checked;
-  const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
-  if(terminalAutoExpandCb) payload.terminal_auto_expand_on_output=terminalAutoExpandCb.checked;
   const apiRedactCb=$('settingsApiRedact');
   if(apiRedactCb) payload.api_redact_enabled=apiRedactCb.checked;
   const showCliCb=$('settingsShowCliSessions');
   if(showCliCb) payload.show_cli_sessions=showCliCb.checked;
-  const showCronCb=$('settingsShowCronSessions');
-  // Gate cron sessions on CLI sessions (the server short-circuits otherwise),
-  // identically to the explicit saveSettings() path, so neither save route can
-  // persist show_cron_sessions=true while show_cli_sessions=false. (#3514)
-  if(showCronCb) payload.show_cron_sessions=!!(showCliCb&&showCliCb.checked&&showCronCb.checked);
   const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
   if(showPreviousMessagingCb) payload.show_previous_messaging_sessions=showPreviousMessagingCb.checked;
   const syncCb=$('settingsSyncInsights');
   if(syncCb) payload.sync_to_insights=syncCb.checked;
   const updateCb=$('settingsCheckUpdates');
   if(updateCb) payload.check_for_updates=updateCb.checked;
-  const ignoreAgentUpdatesCb=$('settingsIgnoreAgentUpdates');
-  if(ignoreAgentUpdatesCb) payload.ignore_agent_updates=ignoreAgentUpdatesCb.checked;
   const whatsNewSummaryCb=$('settingsWhatsNewSummary');
   if(whatsNewSummaryCb) payload.whats_new_summary_enabled=whatsNewSummaryCb.checked;
   const soundCb=$('settingsSoundEnabled');
@@ -6217,9 +5548,6 @@ async function _autosavePreferencesSettings(payload){
       window._simplifiedToolCalling=(saved&&saved.simplified_tool_calling!==false);
       if(typeof clearMessageRenderCache==='function') clearMessageRenderCache();
       if(typeof renderMessages==='function') renderMessages();
-    }
-    if(payload&&payload.terminal_auto_expand_on_output!==undefined){
-      window._terminalAutoExpandOnOutput=!!(saved&&saved.terminal_auto_expand_on_output);
     }
     if(payload&&Object.prototype.hasOwnProperty.call(payload,'fade_text_effect')) window._fadeTextEffect=!!payload.fade_text_effect;
     if(saved&&Object.prototype.hasOwnProperty.call(saved,'pinned_sessions_limit')) window._pinnedSessionsLimit=parseInt(saved.pinned_sessions_limit,10)||3;
@@ -6328,16 +5656,7 @@ async function loadSettingsPanel(){
         _scheduleAppearanceAutosave();
       };
     }
-    const activityExpandedCb=$('settingsActivityFeedExpandedDefault');
-    if(activityExpandedCb){
-      activityExpandedCb.checked=!!settings.activity_feed_expanded_default;
-      window._activityFeedExpandedDefault=activityExpandedCb.checked;
-      activityExpandedCb.onchange=function(){
-        window._activityFeedExpandedDefault=this.checked;
-        _scheduleAppearanceAutosave();
-      };
-    }
-    // Tab visibility/order chips (dynamically populated from DOM)
+    // Tab visibility chips (dynamically populated from DOM)
     var hiddenTabs=[];
     if(Array.isArray(settings.hidden_tabs)){
       // Server value takes priority — even an empty array means "no tabs hidden"
@@ -6346,14 +5665,6 @@ async function loadSettingsPanel(){
       // Server has no hidden_tabs key — fall back to localStorage
       hiddenTabs=_getHiddenTabs();
     }
-    var tabOrder=[];
-    if(Array.isArray(settings.tab_order)){
-      tabOrder=settings.tab_order.filter(function(s){return typeof s==='string'&&s.trim();});
-    }else{
-      tabOrder=_getTabOrder();
-    }
-    _setTabOrder(tabOrder);
-    _applyTabOrder(tabOrder);
     _setHiddenTabs(hiddenTabs);
     _applyTabVisibility(hiddenTabs);
     _renderTabVisibilityChips();
@@ -6402,8 +5713,6 @@ async function loadSettingsPanel(){
       }
       modelSel.addEventListener('change',_markSettingsDirty,{once:false});
     }
-    // Auxiliary models — load task assignments and provider/model options
-    _loadAuxiliaryModels();
     // Send key preference
     const sendKeySel=$('settingsSendKey');
     if(sendKeySel){sendKeySel.value=settings.send_key||'enter';sendKeySel.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
@@ -6419,10 +5728,7 @@ async function loadSettingsPanel(){
         }
       }
       langSel.value=resolvedLanguage;
-      langSel.addEventListener('change',function(){
-        if(typeof setLocale==='function'){setLocale(this.value);if(typeof applyLocaleToDOM==='function')applyLocaleToDOM();}
-        _schedulePreferencesAutosave();
-      },{once:false});
+      langSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
     const showUsageCb=$('settingsShowTokenUsage');
     if(showUsageCb){showUsageCb.checked=!!settings.show_token_usage;showUsageCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
@@ -6462,27 +5768,16 @@ async function loadSettingsPanel(){
     if(fadeTextCb){fadeTextCb.checked=!!settings.fade_text_effect;window._fadeTextEffect=fadeTextCb.checked;fadeTextCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const simplifiedToolCb=$('settingsSimplifiedToolCalling');
     if(simplifiedToolCb){simplifiedToolCb.checked=settings.simplified_tool_calling!==false;simplifiedToolCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
-    const terminalAutoExpandCb=$('settingsTerminalAutoExpand');
-    if(terminalAutoExpandCb){terminalAutoExpandCb.checked=!!settings.terminal_auto_expand_on_output;window._terminalAutoExpandOnOutput=terminalAutoExpandCb.checked;terminalAutoExpandCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const apiRedactCb=$('settingsApiRedact');
     if(apiRedactCb){apiRedactCb.checked=settings.api_redact_enabled!==false;apiRedactCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showCliCb=$('settingsShowCliSessions');
     if(showCliCb){showCliCb.checked=!!settings.show_cli_sessions;showCliCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
-    const showCronCb=$('settingsShowCronSessions');
-    if(showCronCb){
-      showCronCb.checked=!!settings.show_cron_sessions;
-      showCronCb.disabled=showCliCb?!showCliCb.checked:true;
-      showCronCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
-      if(showCliCb){showCliCb.addEventListener('change',function(){showCronCb.disabled=!showCliCb.checked;},{once:false});}
-    }
     const showPreviousMessagingCb=$('settingsShowPreviousMessagingSessions');
     if(showPreviousMessagingCb){showPreviousMessagingCb.checked=!!settings.show_previous_messaging_sessions;showPreviousMessagingCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const syncCb=$('settingsSyncInsights');
     if(syncCb){syncCb.checked=!!settings.sync_to_insights;syncCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const updateCb=$('settingsCheckUpdates');
     if(updateCb){updateCb.checked=settings.check_for_updates!==false;updateCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
-    const ignoreAgentUpdatesCb=$('settingsIgnoreAgentUpdates');
-    if(ignoreAgentUpdatesCb){ignoreAgentUpdatesCb.checked=!!settings.ignore_agent_updates;ignoreAgentUpdatesCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const whatsNewSummaryCb=$('settingsWhatsNewSummary');
     if(whatsNewSummaryCb){whatsNewSummaryCb.checked=!!settings.whats_new_summary_enabled;whatsNewSummaryCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const soundCb=$('settingsSoundEnabled');
@@ -6517,45 +5812,12 @@ async function loadSettingsPanel(){
         if(typeof window._applyVoiceModePref==='function') window._applyVoiceModePref();
       };
     }
-    // TTS engine selector
-    const ttsEngineSel=$('settingsTtsEngine');
-    if(ttsEngineSel){
-      const saved=localStorage.getItem('hermes-tts-engine')||'browser';
-      ttsEngineSel.value=saved;
-      ttsEngineSel.onchange=function(){
-        localStorage.setItem('hermes-tts-engine',this.value);
-        window._populateTtsVoices();
-      };
-    }
-    // Populate voice selector based on engine
+    // Populate voice selector from speechSynthesis
     const ttsVoiceSel=$('settingsTtsVoice');
-    window._populateTtsVoices=function(){
-      if(!ttsVoiceSel) return;
-      const engine=localStorage.getItem('hermes-tts-engine')||'browser';
-      const current=localStorage.getItem('hermes-tts-voice')||'';
-      if(engine==='edge'){
-        const edgeVoices=[
-          {value:'zh-CN-XiaoxiaoNeural',label:'Xiaoxiao (Chinese, Female)'},
-          {value:'zh-CN-XiaoyiNeural',label:'Xiaoyi (Chinese, Female)'},
-          {value:'zh-CN-YunxiNeural',label:'Yunxi (Chinese, Male)'},
-          {value:'zh-CN-YunjianNeural',label:'Yunjian (Chinese, Male)'},
-          {value:'zh-CN-YunyangNeural',label:'Yunyang (Chinese, Male)'},
-          {value:'en-US-AriaNeural',label:'Aria (English, Female)'},
-          {value:'en-US-GuyNeural',label:'Guy (English, Male)'},
-        ];
-        ttsVoiceSel.innerHTML='<option value="">Default (Xiaoxiao)</option>';
-        edgeVoices.forEach(v=>{
-          const opt=document.createElement('option');
-          opt.value=v.value;opt.textContent=v.label;
-          if(v.value===current) opt.selected=true;
-          ttsVoiceSel.appendChild(opt);
-        });
-      } else {
-        if(!('speechSynthesis' in window)){
-          ttsVoiceSel.innerHTML='<option value="">Speech synthesis not available</option>';
-          return;
-        }
+    if(ttsVoiceSel&&'speechSynthesis' in window){
+      const populateVoices=()=>{
         const voices=speechSynthesis.getVoices();
+        const current=localStorage.getItem('hermes-tts-voice')||'';
         ttsVoiceSel.innerHTML='<option value="">Default system voice</option>';
         voices.forEach(v=>{
           const opt=document.createElement('option');
@@ -6563,14 +5825,9 @@ async function loadSettingsPanel(){
           if(v.name===current) opt.selected=true;
           ttsVoiceSel.appendChild(opt);
         });
-      }
-    };
-    if(ttsVoiceSel&&'speechSynthesis' in window){
-      window._populateTtsVoices();
-      speechSynthesis.addEventListener('voiceschanged',function(){
-        const engine=localStorage.getItem('hermes-tts-engine')||'browser';
-        if(engine==='browser') window._populateTtsVoices();
-      },{once:false});
+      };
+      populateVoices();
+      speechSynthesis.addEventListener('voiceschanged',populateVoices,{once:true});
       ttsVoiceSel.onchange=function(){localStorage.setItem('hermes-tts-voice',this.value);};
     }
     // TTS rate/pitch sliders
@@ -6629,7 +5886,6 @@ async function loadSettingsPanel(){
     // tells the truth before a user tries (and the backend now also returns
     // 409 as defense-in-depth).
     const pwEnvLocked=!!settings.password_env_var;
-    _settingsPasswordEnvLocked=pwEnvLocked;
     const pwLockBanner=$('settingsPasswordEnvLock');
     if(pwField){
       pwField.disabled=pwEnvLocked;
@@ -6643,9 +5899,7 @@ async function loadSettingsPanel(){
     try{
       const authStatus=await api('/api/auth/status');
       _setSettingsAuthButtonsVisible(!!authStatus.auth_enabled);
-      _syncPasswordlessButton(authStatus);
     }catch(e){}
-    loadPasskeys();
     // #1560: env-var-locked password also disables the Disable Auth button —
     // clearing settings.password_hash is silent no-op when the env var is set,
     // and the backend now returns 409 anyway, so don't offer the action.
@@ -6667,17 +5921,6 @@ async function loadSettingsPanel(){
 
 // ── Plugins panel (read-only plugin/hook visibility) ───────────────────────
 
-async function handlePluginEnableToggle(pluginKey, checked){
-  try{
-    const body={dashboard_plugins:{}};
-    body.dashboard_plugins[pluginKey]=!!checked;
-    await api('/api/settings',{method:'POST',body:JSON.stringify(body)});
-    loadPluginsPanel();
-  }catch(e){
-    showToast(t('settings_save_failed')+e.message);
-  }
-}
-
 async function loadPluginsPanel(){
   const list=$('pluginsList');
   const empty=$('pluginsEmpty');
@@ -6685,9 +5928,6 @@ async function loadPluginsPanel(){
   try{
     const data=await api('/api/plugins');
     const plugins=Array.isArray((data||{}).plugins)?data.plugins:[];
-    // Hide the Plugins tab when no plugins are installed (#3457)
-    const tabBtn=document.querySelector('[data-settings-section="plugins"]');
-    if(tabBtn) tabBtn.style.display=(data&&data.empty)?'none':'';
     list.innerHTML='';
     if(plugins.length===0){
       list.style.display='none';
@@ -6725,33 +5965,6 @@ function _buildPluginCard(plugin){
     : '<span class="plugin-hook-empty">'+t(isProvider?'plugins_provider_no_hooks':'plugins_no_hooks')+'</span>';
   const version=(plugin&&plugin.version)?' · v'+esc(plugin.version):'';
   const desc=(plugin&&plugin.description)?esc(plugin.description):t('plugins_no_description');
-const enabled=plugin&&plugin.enabled!==false;
-  const tab=plugin&&plugin.tab;
-  const isDashboardPlugin=!!(tab&&tab.path);
-  // No inline onclick/onchange: an inline handler interpolates tab.path/key into
-  // a JS-string-in-attribute context where HTML-escaping is insufficient (a
-  // crafted value could break out). Render inert markup + bind listeners below
-  // with the raw closure values.
-  const openBtn=enabled&&tab&&tab.path
-    ? `<a href="${esc(tab.path)}" class="plugin-open-btn">${esc(tab.label||plugin.name||'Open')} \u2197</a>`
-    : '';
-  const toggleHtml=enabled&&isDashboardPlugin
-    ? `<div class="plugin-card-footer-row">
-         <span class="plugin-toggle-label">${t('plugins_enable_toggle')||'Enabled'}</span>
-         <label class="plugin-toggle-switch">
-           <input type="checkbox" class="plugin-enable-toggle" checked>
-           <span class="plugin-toggle-slider"></span>
-         </label>
-       </div>`
-    : (isDashboardPlugin
-    ? `<div class="plugin-card-footer-row">
-         <span class="plugin-toggle-label">${t('plugins_enable_toggle')||'Enable'}</span>
-         <label class="plugin-toggle-switch">
-           <input type="checkbox" class="plugin-enable-toggle">
-           <span class="plugin-toggle-slider"></span>
-         </label>
-       </div>`
-    : '');
   let badgeText;
   let badgeClass;
   if(isProvider){
@@ -6776,72 +5989,12 @@ const enabled=plugin&&plugin.enabled!==false;
       <div class="provider-card-hint">${desc}</div>
       <div class="provider-card-label">${t('plugins_registered_hooks')}</div>
       <div class="plugin-hook-list">${hookHtml}</div>
-      ${openBtn ? `<div class="plugin-card-footer">${openBtn}</div>` : ''}
-      ${toggleHtml}
     </div>
   `;
-  // Bind handlers with the RAW closure values (not interpolated into inline JS),
-  // so a hostile tab.path/key can't break out of a JS-string attribute context.
-  if(tab&&tab.path){
-    const _openEl=card.querySelector('.plugin-open-btn');
-    if(_openEl){
-      const _p=tab.path, _l=tab.label||plugin.name;
-      _openEl.addEventListener('click', function(ev){ switchPluginPage(ev, _p, _l); });
-    }
-  }
-  if(isDashboardPlugin){
-    const _tog=card.querySelector('.plugin-enable-toggle');
-    if(_tog){
-      const _k=plugin.key;
-      _tog.addEventListener('change', function(){ handlePluginEnableToggle(_k, this.checked); });
-    }
-  }
   return card;
 }
 
-// ── Plugin pages ─────────────────────────────────────────────────────────────
-
-let _currentPluginPage = null;
-
-async function switchPluginPage(event, path, label) {
-  if (event) {
-    event.preventDefault();
-    event.stopPropagation();
-  }
-  if (!_currentPluginPage || _currentPluginPage.path !== path) {
-    await _loadPluginPage(path, label);
-  }
-  // Update _currentPanel so clicking sidebar items won't short-circuit,
-  // but keep the sidebar panel views intact (no panelPlugin exists).
-  _currentPanel = 'plugin';
-  const mainEl = document.querySelector('main.main');
-  if (mainEl) {
-    ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs','plugin'].forEach(p => {
-      mainEl.classList.toggle('showing-' + p, p === 'plugin');
-    });
-  }
-}
-
-async function _loadPluginPage(path, label) {
-  const container = $('pluginPageContainer');
-  const titleEl = $('pluginPageTitle');
-  if (!container) return;
-  if (titleEl) titleEl.textContent = label || path;
-  container.innerHTML = '';
-
-  // Use an iframe for full isolation (styles, scripts, modals stay sandboxed).
-  // Security note: plugins are locally-installed (~/.hermes/plugins/), similar
-  // trust model to VS Code extensions — only install plugins you trust.
-  const iframe = document.createElement('iframe');
-  iframe.src = path;
-  iframe.style.cssText = 'width:100%;height:100%;border:none;display:block;';
-  iframe.setAttribute('title', label || 'Plugin');
-  iframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups');
-  container.appendChild(iframe);
-  _currentPluginPage = { path, label };
-}
-
-// ── Providers panel ─────────────────────────────────────────────────────────
+// ── Providers panel ───────────────────────────────────────────────────────
 
 const _providerCardEls = new Map(); // providerId → {card, statusDot, input, saveBtn, removeBtn}
 
@@ -6859,7 +6012,7 @@ async function loadProvidersPanel(){
   try{
     const data=await api('/api/providers');
     const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()}));
-    const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom||p.is_plugin_provider);
+    const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom);
     list.innerHTML='';
     _providerCardEls.clear();
     const quotaCard=_buildProviderQuotaCard(quota);
@@ -7358,19 +6511,7 @@ async function _removeProviderKey(providerId){
       if(els.saveBtn){els.saveBtn.disabled=false;els.saveBtn.textContent=t('providers_save');}
     }
   }catch(e){
-    // A 403 from /api/providers/delete fires when the CSRF cookie/header
-    // pair has drifted. The server distinguishes three reasons in
-    // api/routes.py:_csrf_rejection_error ("Session expired - reload the
-    // page", "Cross-origin mismatch - check reverse proxy headers", and
-    // the fallback "Cross-origin request rejected"); api()'s catch lifts
-    // that string onto e.message. Pass it through verbatim so the
-    // deployment-shape failure #2572 calls out keeps its actionable hint
-    // instead of being flattened to a single generic toast.
-    if(e&&e.status===403){
-      showToast(e.message||'Session expired. Reload the page and try again.',6000,'error');
-    }else{
-      showToast('Error: '+e.message);
-    }
+    showToast('Error: '+e.message);
     if(els.saveBtn){els.saveBtn.disabled=false;els.saveBtn.textContent=t('providers_save');}
   }
 }
@@ -7386,13 +6527,10 @@ function _refreshModelDropdownsAfterProviderChange(){
     if(typeof window._invalidateSlashModelCache==='function'){
       window._invalidateSlashModelCache();
     }
-    // Fire-and-forget: don't block the providers panel refresh on a
-    // dropdown rebuild. The composer/Settings dropdowns will catch up
-    // on the very next paint frame.
-    if(typeof window._ensureModelDropdownReady==='function'){
-      window._modelDropdownReady=null;
-      Promise.resolve(window._ensureModelDropdownReady()).catch(()=>{});
-    }else if(typeof populateModelDropdown==='function'){
+    if(typeof populateModelDropdown==='function'){
+      // Fire-and-forget: don't block the providers panel refresh on a
+      // dropdown rebuild. The composer/Settings dropdowns will catch up
+      // on the very next paint frame.
       Promise.resolve(populateModelDropdown()).catch(()=>{});
     }
   }catch(_e){
@@ -7408,111 +6546,22 @@ async function _refreshProviderModels(providerId, btn){
     const res=await api('/api/models/refresh',{method:'POST',body:JSON.stringify({provider:providerId})});
     if(res.ok){
       showToast(t('providers_models_refreshed')||('Models refreshed for '+res.provider));
-      _refreshModelDropdownsAfterProviderChange();
     }else{
       showToast(res.error||'Failed to refresh models');
     }
   }catch(e){
-    showToast(e.status===404?'Refresh not available for this provider.':(e.message||'Failed to refresh models'));
+    showToast('Error: '+e.message);
   }finally{
     btn.disabled=false;
     btn.innerHTML=orig;
   }
 }
 
-let _settingsPasswordEnvLocked=false;
 function _setSettingsAuthButtonsVisible(active){
   const signOutBtn=$('btnSignOut');
   if(signOutBtn) signOutBtn.style.display=active?'':'none';
   const disableBtn=$('btnDisableAuth');
   if(disableBtn) disableBtn.style.display=active?'':'none';
-  const passkeyBtn=$('btnRegisterPasskey');
-  if(passkeyBtn) passkeyBtn.disabled=!active||!window.PublicKeyCredential||!navigator.credentials;
-}
-function _syncPasswordlessButton(authStatus){
-  const btn=$('btnGoPasswordless');
-  if(!btn) return;
-  const can=!!(authStatus&&authStatus.auth_enabled&&authStatus.password_auth_enabled&&authStatus.passkeys_count>0&&!_settingsPasswordEnvLocked);
-  btn.style.display=can?'':'none';
-  btn.disabled=!can;
-}
-
-function _b64uToBytes(s){
-  s=String(s||'').replace(/-/g,'+').replace(/_/g,'/');
-  while(s.length%4) s+='=';
-  const bin=atob(s), out=new Uint8Array(bin.length);
-  for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
-  return out;
-}
-function _bytesToB64u(buf){
-  const bytes=new Uint8Array(buf);let bin='';
-  for(let i=0;i<bytes.length;i++) bin+=String.fromCharCode(bytes[i]);
-  return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/g,'');
-}
-
-async function loadPasskeys(){
-  const list=$('passkeyList');
-  const block=$('passkeysSettingsBlock');
-  if(!list) return;
-  // Stage-batch14: respect the HERMES_WEBUI_PASSKEY feature flag — hide the
-  // whole block when passkey support is disabled at the server level so users
-  // don't see a non-functional "Add passkey" button (clicking it would 404).
-  try{
-    const status=await api('/api/auth/status');
-    if(status && status.passkey_feature_flag === false){
-      if(block) block.style.display='none';
-      return;
-    }
-    if(block) block.style.display='';
-  }catch(_e){
-    // If /api/auth/status fails, keep the block hidden to avoid showing a
-    // broken affordance.
-    if(block) block.style.display='none';
-    return;
-  }
-  if(!window.PublicKeyCredential||!navigator.credentials){
-    list.textContent='Passkeys are not supported by this browser/context.';
-    const btn=$('btnRegisterPasskey'); if(btn) btn.disabled=true;
-    return;
-  }
-  try{
-    const data=await api('/api/auth/passkeys',{method:'POST',body:'{}'});
-    if(data && data.disabled){
-      if(block) block.style.display='none';
-      return;
-    }
-    const creds=(data&&data.credentials)||[];
-    if(!creds.length){list.textContent='No passkeys registered.';return;}
-    list.innerHTML=creds.map(c=>`<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid var(--border);border-radius:8px;padding:8px;margin-top:6px"><span>${esc(c.label||'Passkey')}</span><button class="btn-tiny" onclick="deletePasskey('${esc(c.id)}')">Remove</button></div>`).join('');
-  }catch(e){list.textContent='Failed to load passkeys: '+e.message;}
-}
-
-async function registerPasskey(){
-  if(!window.PublicKeyCredential||!navigator.credentials){showToast('Passkeys require a supported browser and secure context.');return;}
-  const label='This device';
-  try{
-    const optData=await api('/api/auth/passkey/register/options',{method:'POST',body:'{}'});
-    const pk=optData.publicKey;
-    pk.challenge=_b64uToBytes(pk.challenge);
-    pk.user=Object.assign({},pk.user,{id:_b64uToBytes(pk.user.id)});
-    if(Array.isArray(pk.excludeCredentials)) pk.excludeCredentials=pk.excludeCredentials.map(c=>Object.assign({},c,{id:_b64uToBytes(c.id)}));
-    const cred=await navigator.credentials.create({publicKey:pk});
-    if(!cred) throw new Error('Passkey registration cancelled');
-    await api('/api/auth/passkey/register',{method:'POST',body:JSON.stringify({
-      id:cred.id,rawId:_bytesToB64u(cred.rawId),type:cred.type,label,
-      response:{clientDataJSON:_bytesToB64u(cred.response.clientDataJSON),attestationObject:_bytesToB64u(cred.response.attestationObject)}
-    })});
-    showToast('Passkey registered');
-    loadPasskeys();
-    try{_syncPasswordlessButton(await api('/api/auth/status'));}catch(_e){}
-  }catch(e){showToast('Passkey registration failed: '+e.message);}
-}
-
-async function deletePasskey(id){
-  const ok=await showConfirmDialog({title:'Remove passkey?',message:'This browser/device will no longer be able to sign in with that passkey.',confirmLabel:'Remove',danger:true,focusCancel:true});
-  if(!ok) return;
-  try{await api('/api/auth/passkey/delete',{method:'POST',body:JSON.stringify({id})});showToast('Passkey removed');loadPasskeys();try{_syncPasswordlessButton(await api('/api/auth/status'));}catch(_e){}}
-  catch(e){showToast('Failed to remove passkey: '+e.message);}
 }
 
 function _applySavedSettingsUi(saved, body, opts){
@@ -7529,7 +6578,6 @@ function _applySavedSettingsUi(saved, body, opts){
   window._whatsNewSummaryEnabled=!!body.whats_new_summary_enabled;
   window._showThinking=body.show_thinking!==false;
   window._simplifiedToolCalling=body.simplified_tool_calling!==false;
-  window._terminalAutoExpandOnOutput=!!body.terminal_auto_expand_on_output;
   window._sessionJumpButtonsEnabled=!!body.session_jump_buttons;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   window._sidebarDensity=sidebarDensity==='detailed'?'detailed':'compact';
@@ -7571,7 +6619,7 @@ async function checkUpdatesNow(){
   if(label) label.textContent=t('settings_checking');
   if(status) status.textContent='';
   try {
-    const data=await api('/api/updates/check',{method:'POST',body:JSON.stringify({force:true}),timeoutMs:60000});
+    const data=await api('/api/updates/check?force=1',{timeoutMs:60000});
     if(data.disabled){
       if(status){status.textContent=t('settings_updates_disabled');status.style.color='var(--muted)';}
     } else {
@@ -7621,223 +6669,6 @@ async function checkUpdatesNow(){
   }
 }
 
-// ── Auxiliary Models ──────────────────────────────────────────────────────────
-
-// Canonical auxiliary task slots with display names.
-// Keep in sync with hermes_cli/main.py _AUX_TASKS and hermes_cli/web_server.py _AUX_TASK_SLOTS.
-const _AUX_TASK_SLOTS=[
- {key:'vision',name:'Vision',desc:'image/screenshot analysis'},
- {key:'compression',name:'Compression',desc:'context summarization'},
- {key:'web_extract',name:'Web extract',desc:'web page summarization'},
- {key:'session_search',name:'Session search',desc:'past-conversation recall'},
- {key:'approval',name:'Approval',desc:'smart command approval'},
- {key:'mcp',name:'MCP',desc:'MCP tool reasoning'},
- {key:'title_generation',name:'Title generation',desc:'session titles'},
- {key:'skills_hub',name:'Skills hub',desc:'skills search/install'},
- {key:'curator',name:'Curator',desc:'skill-usage review pass'},
-];
-
-let _auxProviders=[];       // cached provider list from /api/model/options
-let _auxOriginalConfig=null; // snapshot of initial config for dirty detection
-
-function _auxSelectStyle(){
- return 'width:100%;padding:6px 8px;background:var(--code-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:12px;box-sizing:border-box';
-}
-
-function _buildAuxProviderOptions(sel,providers,currentProvider){
- sel.innerHTML='';
- // "auto" = use main model
- const autoOpt=document.createElement('option');
- autoOpt.value='auto';autoOpt.textContent='auto ('+t('settings_aux_provider_auto')+')';
- if(currentProvider==='auto'||!currentProvider) autoOpt.selected=true;
- sel.appendChild(autoOpt);
- for(const p of providers){
-  const opt=document.createElement('option');
-  opt.value=p.slug;opt.textContent=p.name;
-  if(p.slug===currentProvider) opt.selected=true;
-  sel.appendChild(opt);
- }
-}
-
-function _buildAuxModelOptions(sel,provider,providers,currentModel){
- sel.innerHTML='';
- const emptyOpt=document.createElement('option');
- emptyOpt.value='';emptyOpt.textContent=t('settings_aux_model_auto')||'auto (use provider default)';
- sel.appendChild(emptyOpt);
- if(!provider||provider==='auto'){
-  sel.value=currentModel||'';
-  return;
- }
- // Find matching provider in cached list
- const pData=providers.find(p=>p.slug===provider);
- if(pData&&pData.models){
-  for(const mId of pData.models){
-   const opt=document.createElement('option');
-   opt.value=mId;opt.textContent=mId;
-   if(mId===currentModel) opt.selected=true;
-   sel.appendChild(opt);
-  }
- }
- // Always allow custom model — add a text input option hint
- const customOpt=document.createElement('option');
- customOpt.value='__custom__';customOpt.textContent=t('settings_aux_model_custom')||'Custom model…';
- sel.appendChild(customOpt);
- // If currentModel not in list and not empty, add it as a custom option
- if(currentModel&&!pData?.models?.includes(currentModel)){
-  const existingOpt=document.createElement('option');
-  existingOpt.value=currentModel;existingOpt.textContent=currentModel+' (configured)';
-  existingOpt.selected=true;
-  sel.insertBefore(existingOpt,customOpt);
- }
-}
-
-function _onAuxProviderChange(taskKey,providers){
- const provSel=$('aux-prov-'+taskKey);
- const modelSel=$('aux-model-'+taskKey);
- if(!provSel||!modelSel) return;
- const provider=provSel.value;
- _buildAuxModelOptions(modelSel,provider,providers,'');
- _markAuxDirty();
-}
-
-async function _onAuxModelChange(taskKey){
- const modelSel=$('aux-model-'+taskKey);
- if(!modelSel) return;
- if(modelSel.value==='__custom__'){
-  const customModel=await showPromptDialog({title:t('settings_aux_model_custom')||'Custom model',message:t('settings_aux_model_custom_prompt')||'Enter model ID:',placeholder:'model/provider:model-id',confirmLabel:t('settings_btn_apply_aux_models')||'Apply'});
-  if(customModel&&customModel.trim()){
-   // Insert custom model option before the __custom__ option
-   const opt=document.createElement('option');
-   opt.value=customModel.trim();opt.textContent=customModel.trim();
-   // Remove __custom__ selection
-   const customIdx=[...modelSel.options].findIndex(o=>o.value==='__custom__');
-   if(customIdx>=0) modelSel.insertBefore(opt,modelSel.options[customIdx]);
-   modelSel.value=customModel.trim();
-  }else{
-   modelSel.value='';
-  }
- }
- _markAuxDirty();
-}
-
-function _markAuxDirty(){
- const applyBtn=$('btnApplyAuxModels');
- if(applyBtn) applyBtn.style.display='';
- _markSettingsDirty();
-}
-
-async function _loadAuxiliaryModels(){
- const container=$('auxModelsContainer');
- if(!container) return;
- container.innerHTML='<div style="color:var(--muted);font-size:12px">'+(t('settings_aux_loading')||'Loading…')+'</div>';
-
- try{
- // Fetch auxiliary config AND the WebUI's own /api/models for provider/model lists
- const [auxData,modelsData]=await Promise.all([
- api('/api/model/auxiliary').catch(()=>null),
- api('/api/models').catch(()=>null),
- ]);
- // Build provider list from /api/models groups
- // /api/models returns: { groups: [{ provider: str, provider_id: str, models: [{id,label}] }] }
- const groups=(modelsData&&modelsData.groups)||[];
- _auxProviders=groups.filter(g=>g.provider&&g.models&&g.models.length>0).map(g=>({
- slug:g.provider_id||g.provider,
- name:g.provider,
- models:g.models.map(m=>m.id),
- }));
- const tasks=(auxData&&auxData.tasks)||[];
-  // Build a quick lookup: taskKey → {provider, model}
-  const taskMap={};
-  for(const t of tasks) taskMap[t.task]=t;
-  _auxOriginalConfig=JSON.parse(JSON.stringify(taskMap));
-
-  container.innerHTML='';
-  for(const slot of _AUX_TASK_SLOTS){
-   const cfg=taskMap[slot.key]||{provider:'auto',model:''};
-   const row=document.createElement('div');
-   row.style.cssText='display:grid;grid-template-columns:120px 1fr 1fr;gap:8px;align-items:center;margin-bottom:8px';
-
-   // Task name + description
-   const label=document.createElement('div');
-   label.style.cssText='font-size:12px;font-weight:500;color:var(--text);line-height:1.3';
-   label.innerHTML=esc(slot.name)+'<div style="font-size:10px;color:var(--muted);font-weight:400">'+esc(slot.desc)+'</div>';
-   row.appendChild(label);
-
-   // Provider select
-   const provSel=document.createElement('select');
-   provSel.id='aux-prov-'+slot.key;
-   provSel.style.cssText=_auxSelectStyle();
-   _buildAuxProviderOptions(provSel,_auxProviders,cfg.provider);
-   provSel.addEventListener('change',()=>_onAuxProviderChange(slot.key,_auxProviders));
-   row.appendChild(provSel);
-
-   // Model select
-   const modelSel=document.createElement('select');
-   modelSel.id='aux-model-'+slot.key;
-   modelSel.style.cssText=_auxSelectStyle();
-   _buildAuxModelOptions(modelSel,cfg.provider,_auxProviders,cfg.model);
-   modelSel.addEventListener('change',()=>_onAuxModelChange(slot.key));
-   row.appendChild(modelSel);
-
-   container.appendChild(row);
-  }
-  // Hide apply button (no changes yet)
-  const applyBtn=$('btnApplyAuxModels');
-  if(applyBtn) applyBtn.style.display='none';
-
-  // Reset button
-  const resetBtn=$('btnResetAuxModels');
-  if(resetBtn&&!resetBtn._bound){
-   resetBtn._bound=true;
-   resetBtn.addEventListener('click',async()=>{
-    if(!(await showConfirmDialog({title:t('settings_aux_reset_confirm_title')||'Reset auxiliary models?',message:t('settings_aux_reset_confirm_msg')||'This will set all auxiliary tasks to auto (use main model).',confirmLabel:t('settings_btn_reset_aux_models')||'Reset',danger:true}))) return;
-    try{
-     await api('/api/model/set',{method:'POST',body:JSON.stringify({scope:'auxiliary',task:'__reset__',provider:'auto',model:''})});
-     if(typeof showToast==='function') showToast(t('settings_aux_reset_done')||'Auxiliary models reset to auto');
-     _loadAuxiliaryModels();
-    }catch(e){
-     if(typeof showToast==='function') showToast(t('settings_aux_save_failed')||'Failed to reset auxiliary models');
-    }
-   });
-  }
-
-  // Apply button
-  if(applyBtn&&!applyBtn._bound){
-   applyBtn._bound=true;
-   applyBtn.addEventListener('click',_applyAuxModels);
-  }
- }catch(e){
-  console.warn('[settings] auxiliary models load failed',e);
-  container.innerHTML='<div style="color:var(--muted);font-size:12px">'+(t('settings_aux_load_failed')||'Could not load auxiliary model settings. Make sure the agent API is available.')+'</div>';
- }
-}
-
-async function _applyAuxModels(){
- let saved=0;
- for(const slot of _AUX_TASK_SLOTS){
-  const provSel=$('aux-prov-'+slot.key);
-  const modelSel=$('aux-model-'+slot.key);
-  if(!provSel) continue;
-  const provider=provSel.value;
-  const model=(modelSel&&modelSel.value!=='__custom__')?(modelSel.value||''):'';
-  const orig=_auxOriginalConfig?.[slot.key]||{provider:'auto',model:''};
-  // Only save if changed
-  if(provider!==orig.provider||model!==orig.model){
-   try{
-    await api('/api/model/set',{method:'POST',body:JSON.stringify({scope:'auxiliary',task:slot.key,provider,model})});
-    saved++;
-   }catch(e){
-    console.warn('[settings] failed to save aux task',slot.key,e);
-    if(typeof showToast==='function') showToast(t('settings_aux_save_failed')||'Failed to save auxiliary model for '+slot.name);
-    return;
-   }
-  }
- }
- if(typeof showToast==='function') showToast(saved?(t('settings_aux_saved')||'Auxiliary models updated'):(t('settings_aux_no_changes')||'No changes to apply'));
- // Reload to refresh state
- _loadAuxiliaryModels();
-}
-
 async function saveSettings(andClose){
   const model=($('settingsModel')||{}).value;
   const modelChanged=(model||'')!==(_settingsHermesDefaultModelOnOpen||'');
@@ -7847,7 +6678,6 @@ async function saveSettings(andClose){
   const showTps=!!($('settingsShowTps')||{}).checked;
   const fadeTextEffect=!!($('settingsFadeTextEffect')||{}).checked;
   const showCliSessions=!!($('settingsShowCliSessions')||{}).checked;
-  const showCronSessions=!!($('settingsShowCronSessions')||{}).checked;
   const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
   const pinnedSessionsLimit=parseInt(($('settingsPinnedSessionsLimit')||{}).value,10)||3;
   const pw=($('settingsPassword')||{}).value;
@@ -7871,17 +6701,12 @@ async function saveSettings(andClose){
   body.show_tps=showTps;
   body.fade_text_effect=fadeTextEffect;
   body.simplified_tool_calling=!!($('settingsSimplifiedToolCalling')||{}).checked;
-  body.terminal_auto_expand_on_output=!!($('settingsTerminalAutoExpand')||{}).checked;
   body.api_redact_enabled=!!($('settingsApiRedact')||{}).checked;
   body.show_cli_sessions=showCliSessions;
-  // Cron sessions are gated on CLI sessions (server short-circuits otherwise);
-  // mirror the autosave path so the explicit Save Settings button persists it too. (#3514)
-  body.show_cron_sessions=showCliSessions&&showCronSessions;
   body.show_previous_messaging_sessions=showPreviousMessagingSessions;
   body.pinned_sessions_limit=pinnedSessionsLimit;
   body.sync_to_insights=!!($('settingsSyncInsights')||{}).checked;
   body.check_for_updates=!!($('settingsCheckUpdates')||{}).checked;
-  body.ignore_agent_updates=!!($('settingsIgnoreAgentUpdates')||{}).checked;
   body.whats_new_summary_enabled=!!($('settingsWhatsNewSummary')||{}).checked;
   body.sound_enabled=!!($('settingsSoundEnabled')||{}).checked;
   body.rtl=!!($('settingsRtl')||{}).checked;
@@ -7943,31 +6768,17 @@ async function signOut(){
   }
 }
 
-async function goPasswordless(){
-  const ok=await showConfirmDialog({title:'Go passwordless?',message:'This removes the password and keeps passkey sign-in enabled. Keep at least one passkey registered or you could lose access.',confirmLabel:'Go passwordless',danger:false,focusCancel:true});
-  if(!ok) return;
-  try{
-    const saved=await api('/api/settings',{method:'POST',body:JSON.stringify({_passwordless:true})});
-    showToast('Password removed. Passkey sign-in remains enabled.');
-    _setSettingsAuthButtonsVisible(!!saved.auth_enabled);
-    _syncPasswordlessButton({auth_enabled:saved.auth_enabled,password_auth_enabled:false,passkeys_count:1});
-    const pwField=$('settingsPassword'); if(pwField) pwField.value='';
-  }catch(e){showToast('Failed to go passwordless: '+e.message);}
-}
-
 async function disableAuth(){
   const _disAuth=await showConfirmDialog({title:t('disable_auth_confirm_title'),message:t('disable_auth_confirm_message'),confirmLabel:t('disable'),danger:true,focusCancel:true});
   if(!_disAuth) return;
   try{
     await api('/api/settings',{method:'POST',body:JSON.stringify({_clear_password:true})});
     showToast(t('auth_disabled'));
-    // Hide auth controls since auth is now off
+    // Hide both auth buttons since auth is now off
     const disableBtn=$('btnDisableAuth');
     if(disableBtn) disableBtn.style.display='none';
     const signOutBtn=$('btnSignOut');
     if(signOutBtn) signOutBtn.style.display='none';
-    _syncPasswordlessButton({auth_enabled:false,password_auth_enabled:false,passkeys_count:0});
-    loadPasskeys();
   }catch(e){
     showToast(t('disable_auth_failed')+e.message);
   }
@@ -8099,16 +6910,6 @@ function _mcpStatusLabel(status){
   }[status]||'mcp_status_unknown';
   return t(key);
 }
-function toggleMcpServer(name, enabled){
-  api('/api/mcp/servers/'+encodeURIComponent(name),{
-    method:'PATCH',
-    body:JSON.stringify({enabled:enabled}),
-  }).then(r=>{
-    if(r&&r.ok) showToast(t(enabled?'mcp_enabled_toast':'mcp_disabled_toast',name));
-    else showToast(t('mcp_toggle_failed'),'error');
-    loadMcpServers();
-  }).catch(()=>{showToast(t('mcp_toggle_failed'),'error');loadMcpServers();});
-}
 function loadMcpServers(){
   const list=$('mcpServerList');
   if(!list) return;
@@ -8119,6 +6920,7 @@ function loadMcpServers(){
       list.innerHTML=`<div class="mcp-empty-state" style="color:var(--muted);font-size:12px;padding:6px 0">${esc(t('mcp_no_servers'))}</div>`;
       return;
     }
+    const toggleNote=r.toggle_supported?'':'<div class="mcp-readonly-note">'+esc(t('mcp_toggle_followup'))+'</div>';
     list.innerHTML=r.servers.map(s=>{
       const transportLabel=s.transport==='http'?'HTTP':s.transport==='stdio'?'stdio':(''+(s.transport||'unknown'));
       const transportClass=s.transport==='http'?'mcp-http':s.transport==='stdio'?'mcp-stdio':'mcp-unknown';
@@ -8132,11 +6934,6 @@ function loadMcpServers(){
       const envInfo=s.env?Object.entries(s.env).map(([k,v])=>`${k}=${v}`).join(', '):'';
       const headersInfo=s.headers?Object.entries(s.headers).map(([k,v])=>`${k}=${v}`).join(', '):'';
       const secretInfo=[envInfo,headersInfo].filter(Boolean).join(' | ');
-      const isEnabled=s.enabled!==false;
-      const encodedName=encodeURIComponent(s.name).replace(/'/g,"\\'");
-      const toggleBtn=r.toggle_supported
-        ?`<button type="button" class="mcp-toggle-btn ${isEnabled?'mcp-toggle-enabled':'mcp-toggle-disabled'}" title="${esc(t(isEnabled?'mcp_disable_server':'mcp_enable_server'))}" onclick="toggleMcpServer('${encodedName}',${!isEnabled})">${esc(t(isEnabled?'mcp_enabled_yes':'mcp_enabled_no'))}</button>`
-        :`<span>${esc(t(isEnabled?'mcp_enabled_yes':'mcp_enabled_no'))}</span>`;
       return `<div class="mcp-server-row">
         <div class="mcp-server-row-head">
           <span class="mcp-server-name">${esc(s.name)}</span>
@@ -8144,9 +6941,9 @@ function loadMcpServers(){
           ${statusBadge}
         </div>
         <div class="mcp-server-detail">${esc(detail)}${secretInfo?' | '+esc(secretInfo):''}</div>
-        <div class="mcp-server-meta"><span class="mcp-tool-count">${esc(t('mcp_tool_count',toolCount))}</span>${toggleBtn}</div>
+        <div class="mcp-server-meta"><span class="mcp-tool-count">${esc(t('mcp_tool_count',toolCount))}</span><span>${esc(t(s.enabled===false?'mcp_enabled_no':'mcp_enabled_yes'))}</span></div>
       </div>`;
-    }).join('');
+    }).join('')+toggleNote;
   }).catch(()=>{list.innerHTML=`<div class="mcp-error-state" style="color:#ef4444;font-size:12px;padding:6px 0">${esc(t('mcp_load_failed'))}</div>`});
 }
 let _mcpToolsCache=[];
@@ -8283,13 +7080,7 @@ function loadGatewayStatus(){
       return;
     }
     if(!r.running){
-      const reason = _gatewayStatusReason(r);
-      const statusLabel = reason === 'gateway_stale_running_state'
-        ? 'Gateway metadata stale'
-        : reason === 'remote_gateway_unreachable'
-          ? 'Gateway endpoint not reachable'
-          : 'Gateway not running';
-      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>${esc(statusLabel)}</div>`;
+      card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>Gateway not running</div>`;
       return;
     }
     const platformIcons={telegram:'💬',discord:'🎮',slack:'📝',web:'🌐',api:'🔌'};
