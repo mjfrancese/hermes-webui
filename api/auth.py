@@ -1,7 +1,7 @@
 """
-Hermes Web UI -- optional authentication.
-Off by default. Enable by setting HERMES_WEBUI_PASSWORD, configuring a
-password in Settings, or registering passkeys and then going passwordless.
+Hermes Web UI -- Optional password authentication.
+Off by default. Enable by setting HERMES_WEBUI_PASSWORD env var
+or configuring a password in the Settings panel.
 """
 import hashlib
 import hmac
@@ -9,7 +9,6 @@ import http.cookies
 import json
 import logging
 import os
-import re
 import secrets
 import tempfile
 import threading
@@ -50,40 +49,12 @@ def _resolve_session_ttl() -> int:
 PUBLIC_PATHS = frozenset({
     '/login', '/health', '/favicon.ico', '/sw.js',
     '/api/auth/login', '/api/auth/status',
-    '/api/auth/passkey/options', '/api/auth/passkey/login',
     '/manifest.json', '/manifest.webmanifest',
     '/session/manifest.json', '/session/manifest.webmanifest',
 })
 
 COOKIE_NAME = 'hermes_session'
 CSRF_HEADER_NAME = 'X-Hermes-CSRF-Token'
-
-
-# RFC 6265 cookie-name token: a non-empty run of token chars
-# (no controls, whitespace, or separators such as ';', '=', ',').
-_COOKIE_NAME_RE = re.compile(r"^[-!#$%&'*+.^_`|~0-9A-Za-z]+$")
-
-
-def _resolve_cookie_name() -> str:
-    """Resolve the auth session cookie name from env > default.
-
-    Honours ``HERMES_WEBUI_COOKIE_NAME`` so multiple WebUI instances sharing a
-    hostname (different ports) can use distinct cookie names instead of
-    trampling each other's session — browsers scope cookies by host, not
-    host+port (RFC 6265). Falls back to ``COOKIE_NAME`` when the env var is
-    unset, empty, or not a valid RFC 6265 token.
-    """
-    name = os.getenv('HERMES_WEBUI_COOKIE_NAME', '').strip()
-    if not name:
-        return COOKIE_NAME
-    if _COOKIE_NAME_RE.match(name):
-        return name
-    logger.warning(
-        'Ignoring invalid HERMES_WEBUI_COOKIE_NAME=%r; falling back to %r '
-        '(name must be a valid RFC 6265 token)', name, COOKIE_NAME,
-    )
-    return COOKIE_NAME
-
 
 _SESSIONS_FILE = STATE_DIR / '.sessions.json'
 
@@ -133,7 +104,6 @@ def _save_sessions(sessions: dict[str, float]) -> None:
 
 # Active sessions: token -> expiry timestamp (persisted across restarts via STATE_DIR)
 _sessions = _load_sessions()
-_SESSIONS_LOCK = threading.Lock()
 
 # ── Login rate limiter ──────────────────────────────────────────────────────
 _LOGIN_ATTEMPTS_FILE = STATE_DIR / '.login_attempts.json'
@@ -213,14 +183,6 @@ def _record_login_attempt(ip: str) -> None:
         attempts.append(now)
         _login_attempts[ip] = attempts
         _save_login_attempts(_login_attempts)
-
-
-def _clear_login_attempts(ip: str) -> None:
-    """Clear failed login attempts after a successful login (thread-safe)."""
-    with _LOGIN_ATTEMPTS_LOCK:
-        if ip in _login_attempts:
-            _login_attempts.pop(ip, None)
-            _save_login_attempts(_login_attempts)
 
 
 def _load_key(filename: str) -> bytes:
@@ -328,59 +290,9 @@ def get_password_hash() -> str | None:
         return result
 
 
-def is_password_auth_enabled() -> bool:
+def is_auth_enabled() -> bool:
     """True if a password is configured (env var or settings)."""
     return get_password_hash() is not None
-
-
-def _passkey_feature_flag_enabled() -> bool:
-    """Return True if the passkey/WebAuthn surface is enabled for this deployment.
-
-    Passkey support is opt-in default-off behind a feature flag so deployments
-    that don't want the WebAuthn surface (or whose RP-ID setup isn't ready for
-    non-localhost hosts) can disable it entirely with no UI surface, no
-    endpoints, no credential storage. To enable:
-
-      - Set ``HERMES_WEBUI_PASSKEY=1`` in the environment, OR
-      - Set ``webui_passkey_enabled: true`` in the per-profile config.yaml
-
-    With the flag off, ``are_passkeys_enabled()`` always returns False even if
-    credentials were registered in the past, and ``/login`` shows password-only.
-    """
-    env_value = os.getenv("HERMES_WEBUI_PASSKEY", "")
-    if env_value:
-        return env_value.strip().lower() in {"1", "true", "yes", "on"}
-    try:
-        from api.config import get_config
-
-        cfg = get_config()
-        if isinstance(cfg, dict):
-            raw = cfg.get("webui_passkey_enabled")
-            if isinstance(raw, bool):
-                return raw
-            if isinstance(raw, str):
-                return raw.strip().lower() in {"1", "true", "yes", "on"}
-    except Exception:
-        pass
-    return False
-
-
-def are_passkeys_enabled() -> bool:
-    """True if the passkey feature flag is on AND at least one local passkey credential is registered."""
-    if not _passkey_feature_flag_enabled():
-        return False
-    try:
-        from api.passkeys import passkeys_available
-
-        return passkeys_available()
-    except Exception as exc:
-        logger.debug("Failed to inspect passkey availability: %s", exc)
-        return False
-
-
-def is_auth_enabled() -> bool:
-    """True if password auth or passkey-only auth is configured."""
-    return is_password_auth_enabled() or are_passkeys_enabled()
 
 
 def verify_password(plain: str) -> bool:
@@ -417,9 +329,8 @@ def verify_password(plain: str) -> bool:
 def create_session() -> str:
     """Create a new auth session. Returns signed cookie value."""
     token = secrets.token_hex(32)
-    with _SESSIONS_LOCK:
-        _sessions[token] = time.time() + _resolve_session_ttl()
-        _save_sessions(_sessions)
+    _sessions[token] = time.time() + _resolve_session_ttl()
+    _save_sessions(_sessions)
     sig = hmac.new(_signing_key(), token.encode(), hashlib.sha256).hexdigest()
     return f"{token}.{sig}"
 
@@ -427,12 +338,11 @@ def create_session() -> str:
 def _prune_expired_sessions():
     """Remove all expired session entries to prevent unbounded memory growth."""
     now = time.time()
-    with _SESSIONS_LOCK:
-        expired = [t for t, exp in _sessions.items() if now > exp]
-        if expired:
-            for token in expired:
-                _sessions.pop(token, None)
-            _save_sessions(_sessions)
+    expired = [t for t, exp in _sessions.items() if now > exp]
+    if expired:
+        for token in expired:
+            _sessions.pop(token, None)
+        _save_sessions(_sessions)
 
 
 def verify_session(cookie_value: str) -> bool:
@@ -450,12 +360,10 @@ def verify_session(cookie_value: str) -> bool:
     )
     if not valid:
         return False
-    with _SESSIONS_LOCK:
-        expiry = _sessions.get(token)
-        if not expiry or time.time() > expiry:
-            _sessions.pop(token, None)
-            _save_sessions(_sessions)
-            return False
+    expiry = _sessions.get(token)
+    if not expiry or time.time() > expiry:
+        _sessions.pop(token, None)
+        return False
     return True
 
 
@@ -465,53 +373,6 @@ def _session_token_from_cookie_value(cookie_value: str) -> str | None:
         return None
     token, _sig = cookie_value.rsplit('.', 1)
     return token or None
-
-
-def sign_profile_cookie_value(profile_name: str, session_cookie_value: str | None) -> str:
-    """Return a profile cookie value authenticated for one WebUI session.
-
-    The active-profile cookie is client-controlled, so when auth is enabled it
-    must not be trusted as a bare profile name. Binding the selected profile to
-    the HttpOnly session token prevents a client from forging
-    ``hermes_profile=<other-profile>`` and bypassing profile visibility guards.
-    """
-    if not session_cookie_value or not verify_session(session_cookie_value):
-        raise ValueError("active auth session is required to sign profile cookie")
-    token = _session_token_from_cookie_value(session_cookie_value)
-    if not token:
-        raise ValueError("active auth session is required to sign profile cookie")
-    sig = hmac.new(
-        _signing_key(),
-        f"profile:{token}:{profile_name}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return f"{profile_name}.{sig}"
-
-
-def verify_profile_cookie_value(cookie_value: str, session_cookie_value: str | None) -> str | None:
-    """Verify a session-bound profile cookie and return its profile name."""
-    if not cookie_value or '.' not in cookie_value:
-        return None
-    if not session_cookie_value or not verify_session(session_cookie_value):
-        return None
-    profile_name, sig = cookie_value.rsplit('.', 1)
-    token = _session_token_from_cookie_value(session_cookie_value)
-    if not profile_name or not token or not sig:
-        return None
-    # Defense-in-depth: validate the profile-name pattern here too, not only in
-    # get_profile_cookie(), so any future caller of this verifier can't return an
-    # unvalidated name. (#4023 Opus hardening.)
-    from api.profiles import _PROFILE_ID_RE
-    if profile_name != 'default' and not _PROFILE_ID_RE.fullmatch(profile_name):
-        return None
-    expected = hmac.new(
-        _signing_key(),
-        f"profile:{token}:{profile_name}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    if hmac.compare_digest(str(sig), expected):
-        return profile_name
-    return None
 
 
 def csrf_token_for_session(cookie_value: str) -> str | None:
@@ -541,10 +402,9 @@ def invalidate_session(cookie_value) -> None:
     """Remove a session token."""
     if cookie_value and '.' in cookie_value:
         token = cookie_value.rsplit('.', 1)[0]
-        with _SESSIONS_LOCK:
-            if token in _sessions:
-                _sessions.pop(token, None)
-                _save_sessions(_sessions)
+        if token in _sessions:
+            _sessions.pop(token, None)
+            _save_sessions(_sessions)
 
 
 def parse_cookie(handler) -> str | None:
@@ -557,7 +417,7 @@ def parse_cookie(handler) -> str | None:
         cookie.load(cookie_header)
     except http.cookies.CookieError:
         return None
-    morsel = cookie.get(_resolve_cookie_name())
+    morsel = cookie.get(COOKIE_NAME)
     return morsel.value if morsel else None
 
 
@@ -575,12 +435,10 @@ def check_auth(handler, parsed) -> bool:
         return True
     # Not authorized
     if parsed.path.startswith('/api/'):
-        body = b'{"error":"Authentication required"}'
         handler.send_response(401)
         handler.send_header('Content-Type', 'application/json')
-        handler.send_header('Content-Length', str(len(body)))
         handler.end_headers()
-        handler.wfile.write(body)
+        handler.wfile.write(b'{"error":"Authentication required"}')
     else:
         handler.send_response(302)
         # Pass the original path as ?next= so login.js redirects back after auth.
@@ -610,41 +468,25 @@ def check_auth(handler, parsed) -> bool:
         # `?`, `&`, `=`) gets percent-encoded.
         _next = _urlparse.quote(_path_with_query, safe='/')
         handler.send_header('Location', 'login?next=' + _next)
-        handler.send_header('Content-Length', '0')
         handler.end_headers()
     return False
-
-
-def _is_loopback(addr: str) -> bool:
-    """Return True if *addr* is a loopback address (127.x.x.x, ::1, or ::ffff:127.x.x.x)."""
-    import ipaddress as _ipaddress
-    try:
-        ip = _ipaddress.ip_address(addr)
-        if ip.is_loopback:
-            return True
-        # Python < 3.12: is_loopback is False for ::ffff:127.x.x.x (gh-117566)
-        if hasattr(ip, 'ipv4_mapped') and ip.ipv4_mapped is not None:
-            return ip.ipv4_mapped.is_loopback
-        return False
-    except ValueError:
-        return False
 
 
 def _is_secure_context(handler=None) -> bool:
     """Return True if cookies should carry the Secure flag.
 
-    Priority order:
-    1. ``HERMES_WEBUI_SECURE`` env var: 1/true/yes -> True; 0/false/no -> False.
-    2. Direct TLS socket (handler.request.getpeercert present) -> True.
-    3. ``HERMES_WEBUI_TRUST_FORWARDED_PROTO=1`` opt-in: trust
-       ``X-Forwarded-Proto: https`` header from a known reverse proxy.
-    4. Otherwise -> False (loopback or non-loopback, plain HTTP is not secure).
+    Behaviour is overridable via HERMES_WEBUI_SECURE env var for
+    reverse-proxy setups where TLS terminates at a frontend proxy
+    (nginx, Cloudflare, etc.) and Python only sees plain HTTP.
+    1/true/yes → force Secure on; 0/false/no → force Secure off.
+    When unset, fall back to heuristics: direct TLS socket (getpeercert)
+    or X-Forwarded-Proto header from the request.
 
     .. warning::
-       ``X-Forwarded-Proto`` is only trustworthy behind a reverse proxy.
-       It is ignored unless ``HERMES_WEBUI_TRUST_FORWARDED_PROTO=1`` is
-       set explicitly, preventing header-injection attacks on plain-HTTP
-       deployments.
+       The ``X-Forwarded-Proto`` header is only trustworthy when a
+       reverse proxy (nginx, Cloudflare, etc.) is deployed in front
+       of the application.  Without a proxy, any client can forge the
+       header and cause the Secure flag to be set on plain HTTP.
     """
     env = os.getenv('HERMES_WEBUI_SECURE', '').strip().lower()
     if env in ('1', 'true', 'yes'):
@@ -654,33 +496,29 @@ def _is_secure_context(handler=None) -> bool:
     if handler is not None:
         if getattr(handler.request, 'getpeercert', None) is not None:
             return True
-        trust_fwd = os.getenv('HERMES_WEBUI_TRUST_FORWARDED_PROTO', '').strip().lower()
-        if trust_fwd in ('1', 'true', 'yes'):
-            if handler.headers.get('X-Forwarded-Proto', '') == 'https':
-                return True
+        if handler.headers.get('X-Forwarded-Proto', '') == 'https':
+            return True
     return False
 
 
 def set_auth_cookie(handler, cookie_value) -> None:
     """Set the auth cookie on the response."""
     cookie = http.cookies.SimpleCookie()
-    name = _resolve_cookie_name()
-    cookie[name] = cookie_value
-    cookie[name]['httponly'] = True
-    cookie[name]['samesite'] = 'Lax'
-    cookie[name]['path'] = '/'
-    cookie[name]['max-age'] = str(_resolve_session_ttl())
+    cookie[COOKIE_NAME] = cookie_value
+    cookie[COOKIE_NAME]['httponly'] = True
+    cookie[COOKIE_NAME]['samesite'] = 'Lax'
+    cookie[COOKIE_NAME]['path'] = '/'
+    cookie[COOKIE_NAME]['max-age'] = str(_resolve_session_ttl())
     if _is_secure_context(handler):
-        cookie[name]['secure'] = True
-    handler.send_header('Set-Cookie', cookie[name].OutputString())
+        cookie[COOKIE_NAME]['secure'] = True
+    handler.send_header('Set-Cookie', cookie[COOKIE_NAME].OutputString())
 
 
 def clear_auth_cookie(handler) -> None:
     """Clear the auth cookie on the response."""
     cookie = http.cookies.SimpleCookie()
-    name = _resolve_cookie_name()
-    cookie[name] = ''
-    cookie[name]['httponly'] = True
-    cookie[name]['path'] = '/'
-    cookie[name]['max-age'] = '0'
-    handler.send_header('Set-Cookie', cookie[name].OutputString())
+    cookie[COOKIE_NAME] = ''
+    cookie[COOKIE_NAME]['httponly'] = True
+    cookie[COOKIE_NAME]['path'] = '/'
+    cookie[COOKIE_NAME]['max-age'] = '0'
+    handler.send_header('Set-Cookie', cookie[COOKIE_NAME].OutputString())

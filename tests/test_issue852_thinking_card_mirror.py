@@ -17,12 +17,6 @@ def _read(name):
     return open(os.path.join(_SRC, name), encoding="utf-8").read()
 
 
-def _inline_extractor_body(js):
-    start = js.index("function _extractInlineThinkingFromContent(")
-    end = js.index("if(typeof window", start)
-    return js[start:end]
-
-
 class TestStreamDisplayStripsThinkBlocksAlways:
 
     def test_early_return_on_reasoning_text_is_gone(self):
@@ -39,15 +33,18 @@ class TestStreamDisplayStripsThinkBlocksAlways:
         )
 
     def test_think_pair_stripping_still_runs(self):
-        """The shared inline extractor must still strip think blocks."""
+        """The `_thinkPairs` stripping loop must still be present so the
+        fix actually strips think blocks."""
         js = _read("static/messages.js")
         m = re.search(r'function _streamDisplay\(\)\{.*?\n  \}', js, re.DOTALL)
         assert m
         fn = m.group(0)
-        assert "_extractInlineThinkingFromContent" in fn
-        helper = _inline_extractor_body(js)
-        assert "_thinkPairs" in helper
-        assert "text.startsWith(candidate.open,index)" in helper
+        assert "_thinkPairs" in fn, (
+            "_streamDisplay must iterate _thinkPairs to strip think blocks"
+        )
+        assert "trimmed.startsWith(open)" in fn, (
+            "the think-block stripping must check for the open tag"
+        )
 
     def test_still_handles_incomplete_think_tag_partial_prefix(self):
         """Existing behaviour preserved: partial `<thi`, `<think` prefixes
@@ -56,6 +53,6 @@ class TestStreamDisplayStripsThinkBlocksAlways:
         m = re.search(r'function _streamDisplay\(\)\{.*?\n  \}', js, re.DOTALL)
         assert m
         fn = m.group(0)
-        assert "_extractInlineThinkingFromContent" in fn
-        helper = _inline_extractor_body(js)
-        assert "candidate.open.startsWith(rest)" in helper
+        assert "open.startsWith(trimmed)" in fn, (
+            "Partial-tag suppression must still be present"
+        )

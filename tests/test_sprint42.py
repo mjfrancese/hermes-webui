@@ -55,20 +55,13 @@ class TestSessionDBInjection(unittest.TestCase):
         )
 
     def test_sessiondb_init_in_try_except(self):
-        """SessionDB init must be wrapped in try/except for non-fatal failure handling."""
-        # Check that SessionDB init is wrapped in the helper used by streaming.
-        helper_start = STREAMING_PY.find("def _build_session_db_for_stream")
-        helper_end = STREAMING_PY.find("\n\ndef _attempt_credential_self_heal", helper_start)
-        self.assertGreater(helper_start, -1, "session DB helper missing in streaming.py")
-        helper_src = STREAMING_PY[helper_start:helper_end]
-        pattern = (
-            r"def _build_session_db_for_stream"
-            r"[\s\S]*?try:\s*\n[\s\S]*?from hermes_state import SessionDB[\s\S]*?return SessionDB\(db_path=state_db_path\)[\s\S]*?except Exception as _db_err:"
-        )
+        """SessionDB() init must be wrapped in try/except for non-fatal failure handling."""
+        # Check that the try/except pattern surrounding SessionDB() is present
+        pattern = r"try:\s*\n\s*from hermes_state import SessionDB\s*\n\s*_session_db\s*=\s*SessionDB\(\)"
         self.assertRegex(
-            helper_src,
+            STREAMING_PY,
             pattern,
-            "SessionDB init helper must use try/except for non-fatal error handling",
+            "SessionDB() init must be inside a try block for non-fatal error handling (PR #356)",
         )
 
     def test_sessiondb_failure_logs_warning(self):
@@ -90,18 +83,13 @@ class TestSessionDBInjection(unittest.TestCase):
         )
 
     def test_session_db_default_is_none(self):
-        """SessionDB should now be initialized through the helper call."""
-        pattern = "_state_db_path = (Path(_profile_home) / \"state.db\") if _profile_home else None"
-        helper_pattern = "_session_db = _build_session_db_for_stream(_state_db_path)"
-        self.assertIn(
+        """_session_db must be initialized to None before the try block (safe default)."""
+        # Pattern: _session_db = None followed (eventually) by the try/SessionDB block
+        pattern = r"_session_db\s*=\s*None\s*\n\s*try:"
+        self.assertRegex(
+            STREAMING_PY,
             pattern,
-            STREAMING_PY,
-            "_state_db_path should be resolved from profile home in streaming.py",
-        )
-        self.assertIn(
-            helper_pattern,
-            STREAMING_PY,
-            "_session_db should be initialized via _build_session_db_for_stream in streaming.py",
+            "_session_db must default to None before try/except block (PR #356)",
         )
 
 
@@ -401,41 +389,13 @@ class TestRuntimeRouteInjection(unittest.TestCase):
         init_kwargs = captured["init_kwargs"]
         self.assertIsNotNone(init_kwargs["interim_assistant_callback"])
         self.assertTrue(callable(init_kwargs["interim_assistant_callback"]))
-        self.assertIn("WebUI progress guidance", captured["agent"].ephemeral_system_prompt)
-        self.assertIn("Match the normal Hermes messaging style", captured["agent"].ephemeral_system_prompt)
-        self.assertIn(
-            "do not let long tool-running WebUI turns appear silent",
-            captured["agent"].ephemeral_system_prompt,
-        )
-        self.assertIn(
-            "emit brief user-visible progress updates as normal assistant content",
-            captured["agent"].ephemeral_system_prompt,
-        )
-        self.assertIn(
-            "Before the first tool batch in a long task",
-            captured["agent"].ephemeral_system_prompt,
-        )
-        self.assertIn(
-            "Do not run many independent tool batches back-to-back without visible assistant text between them",
-            captured["agent"].ephemeral_system_prompt,
-        )
-        self.assertIn(
-            "Do not keep progress only in reasoning, thinking, or tool-result channels",
-            captured["agent"].ephemeral_system_prompt,
-        )
-        self.assertNotIn(
-            "you may provide brief user-visible progress updates",
-            captured["agent"].ephemeral_system_prompt,
-        )
+        self.assertIn("WebUI progress contract", captured["agent"].ephemeral_system_prompt)
+        self.assertIn("user-visible progress updates", captured["agent"].ephemeral_system_prompt)
 
         interim_events = []
         while not fake_queue.empty():
             try:
-                item = fake_queue.get_nowait()
-                if isinstance(item, tuple) and len(item) >= 2:
-                    interim_events.append((item[0], item[1]))
-                else:
-                    interim_events.append(item)
+                interim_events.append(fake_queue.get_nowait())
             except queue.Empty:
                 break
         self.assertTrue(
@@ -712,32 +672,23 @@ def test_cleanTitle_is_let_not_const():
 
 # ── Sprint 42 additional tests: thinking panel persistence (#427) ────────
 def test_streaming_persists_reasoning_in_session():
-    """streaming.py must accumulate reasoning and patch assistant messages."""
+    """streaming.py must accumulate reasoning_text and patch last assistant message."""
     src = (REPO / 'api' / 'streaming.py').read_text()
 
-    # #3587: per-message reasoning segments replaced the flat _reasoning_text accumulator
-    assert "_reasoning_segments" in src, \
-        "_reasoning_segments dict not found in streaming.py"
+    # _reasoning_text must be initialised
+    assert "_reasoning_text = ''" in src, \
+        "_reasoning_text variable not initialised in streaming.py"
 
-    # on_reasoning must accumulate non-echo reasoning into segments
-    assert '_reasoning_segments[_current_reasoning_idx]' in src or '_reasoning_segments.get(_current_reasoning_idx' in src, \
-        "on_reasoning callback does not accumulate into per-message _reasoning_segments"
-    assert '_is_visible_output_echo(reasoning_delta)' in src, \
-        "on_reasoning callback should suppress reasoning deltas that only echo visible streamed output"
+    # on_reasoning must accumulate into _reasoning_text
+    assert '_reasoning_text += str(text)' in src, \
+        "on_reasoning callback does not accumulate into _reasoning_text"
 
     # Persistence block must exist before raw_session is built
     assert "Persist reasoning trace in the session so it survives reload" in src, \
         "Reasoning persistence comment not found in streaming.py"
 
-    # #3455: reasoning is now persisted via the think-split path — either the
-    # merged reasoning (inline <think> + on_reasoning stream) or the existing
-    # _reasoning_text when content has no leading block. Both set _rm['reasoning'].
-    assert "_rm['reasoning'] = _merged_reasoning" in src, \
-        "Code to set the last assistant message's reasoning (merged think-split) not found"
-    assert "_split_thinking_from_content(" in src, \
-        "server-side think-split must run before save (#3455)"
-    assert "_rm['reasoning'] = _existing_reasoning" in src, \
-        "the no-think-block branch must still persist _reasoning_text into the assistant message"
+    assert "_rm['reasoning'] = _reasoning_text" in src, \
+        "Code to set _rm['reasoning'] not found in streaming.py"
 
     # Persistence block must come BEFORE raw_session assignment
     persist_idx = src.index("Persist reasoning trace in the session")
@@ -751,11 +702,11 @@ def test_done_handler_patches_reasoning_field():
     src = (REPO / 'static' / 'messages.js').read_text()
 
     # The persistence comment must be present inside the done handler
-    assert "Persist reasoning trace for Worklog Thinking Cards" in src, \
+    assert "Persist reasoning trace so thinking card survives page reload" in src, \
         "Reasoning persistence comment not found in messages.js done handler"
 
     # The guard and assignment must be present
-    assert "if(reasoningText&&lastAsst&&!lastAsst.reasoning)" in src, \
+    assert "if(reasoningText){" in src, \
         "reasoningText guard not found in messages.js"
 
     assert "lastAsst.reasoning=reasoningText" in src, \
@@ -763,7 +714,7 @@ def test_done_handler_patches_reasoning_field():
 
     # Verify the patch is inside the done handler (after 'source.addEventListener' for done)
     done_handler_idx = src.index("source.addEventListener('done'")
-    persist_idx = src.index("Persist reasoning trace for Worklog Thinking Cards")
+    persist_idx = src.index("Persist reasoning trace so thinking card survives page reload")
     assert done_handler_idx < persist_idx, \
         "Reasoning persistence patch must be inside the done SSE handler"
 
@@ -772,21 +723,21 @@ def test_done_handler_patches_reasoning_field():
         "Guard '!lastAsst.reasoning' missing — would overwrite server-persisted reasoning"
 
 
-def test_rendermessages_keeps_reasoning_metadata_out_of_worklog_display():
-    """ui.js renderMessages must not promote provider reasoning metadata into Worklog prose."""
+def test_rendermessages_reads_reasoning_from_messages():
+    """ui.js renderMessages must read m.reasoning to display the thinking card."""
     src = (REPO / 'static' / 'ui.js').read_text()
 
-    sig_fn = src.split("function _messageHasReasoningPayload(m)", 1)[1].split("function", 1)[0]
-    assert 'm.reasoning' in sig_fn, \
-        "m.reasoning should remain part of metadata/cache signature handling"
+    # m.reasoning must be read in the render path
+    assert 'm.reasoning' in src, \
+        "m.reasoning not referenced in ui.js — thinking card won't render on reload"
 
-    # Legacy thinking-card helpers may still exist for explicit debug surfaces.
+    # The thinking card rendering block must also be present
     assert 'thinking-card' in src, \
         "thinking-card CSS class not found in ui.js"
 
-    extraction = src.split("let thinkingText='';", 1)[1].split("const isUser=m.role==='user';", 1)[0]
-    assert 'm.reasoning' not in extraction
-    assert 'm.reasoning_content' not in extraction
+    # Specifically, the fallback that reads from top-level m.reasoning field
+    assert 'thinkingText=m.reasoning' in src.replace(' ', ''), \
+        "thinkingText=m.reasoning assignment not found in ui.js renderMessages"
 
 
 def test_streaming_restores_prior_reasoning_metadata_after_followup():

@@ -2,26 +2,10 @@
 Hermes Web UI -- HTTP helper functions.
 """
 import json as _json
-import logging
 import os
 import re as _re
-import ssl
 from pathlib import Path
 from api.config import IMAGE_EXTS, MD_EXTS
-
-logger = logging.getLogger(__name__)
-
-
-# Treat stalled/closed HTTP clients as normal disconnects.  Long-lived SSE
-# connections often end this way when a browser tab sleeps, a phone switches
-# networks, or Tailscale leaves the socket half-closed.
-_CLIENT_DISCONNECT_ERRORS = (
-    BrokenPipeError,
-    ConnectionResetError,
-    ConnectionAbortedError,
-    TimeoutError,
-    ssl.SSLError,
-)
 
 
 def require(body: dict, *fields) -> None:
@@ -52,81 +36,20 @@ def safe_resolve(root: Path, requested: str) -> Path:
     return resolved
 
 
-_CSP_CONNECT_BASE = (
-    "'self' http://127.0.0.1:* http://localhost:* "
-    "ws://127.0.0.1:* ws://localhost:*"
-)
-_CSP_EXTRA_CONNECT_RE = _re.compile(
-    r"^(?:https?|wss?)://(?:\*\.)?[A-Za-z0-9._~-]+(?::(?P<port>\d{1,5}|\*))?$"
-)
-_CSP_HEADER_NAME = 'Content-Security-Policy'
-_CSP_SHARED_POLICY_TEMPLATE = (
-    "default-src 'self' https://*.cloudflareaccess.com; "
-    "object-src 'none'; "
-    "frame-ancestors 'none'; "
-    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com blob:; "
-    "worker-src blob: 'self' https://cdn.jsdelivr.net; "
-    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
-    "img-src 'self' data: https: blob:; "
-    "font-src 'self' data: https://fonts.gstatic.com; "
-    "media-src 'self' data: blob:; "
-    "connect-src {connect_src}; "
-    "manifest-src 'self' https://*.cloudflareaccess.com; "
-    "base-uri 'self'; form-action 'self'"
-)
-
-
-def _valid_csp_extra_connect_source(source: str) -> bool:
-    match = _CSP_EXTRA_CONNECT_RE.fullmatch(source)
-    if not match:
-        return False
-    port = match.group("port")
-    if not port or port == "*":
-        return True
-    try:
-        return 1 <= int(port) <= 65535
-    except ValueError:
-        return False
-
-
-def _csp_extra_connect_src() -> str:
-    raw = os.getenv("HERMES_WEBUI_CSP_CONNECT_EXTRA", "").strip()
-    if not raw:
-        return ""
-    sources = raw.split()
-    if not sources or any(not _valid_csp_extra_connect_source(src) for src in sources):
-        logger.warning("Ignoring invalid HERMES_WEBUI_CSP_CONNECT_EXTRA value")
-        return ""
-    return " " + " ".join(sources)
-
-
-def _csp_connect_src(extra_connect_src: str = "") -> str:
-    return f"{_CSP_CONNECT_BASE} https://cdn.jsdelivr.net{extra_connect_src}"
-
-
-def _build_csp_enforced_policy(extra_connect_src: str | None = None) -> str:
-    if extra_connect_src is None:
-        extra_connect_src = _csp_extra_connect_src()
-    return _CSP_SHARED_POLICY_TEMPLATE.format(
-        connect_src=_csp_connect_src(extra_connect_src)
-    )
-
-
-def _build_csp_report_only_policy(extra_connect_src: str | None = None) -> str:
-    return (
-        _build_csp_enforced_policy(extra_connect_src)
-        + "; report-uri /api/csp-report; report-to csp-endpoint"
-    )
-
-
 def _security_headers(handler):
     """Add security headers to every response."""
-    extra_connect_src = _csp_extra_connect_src()
-    handler._csp_extra_connect_src = extra_connect_src
     handler.send_header('X-Content-Type-Options', 'nosniff')
     handler.send_header('X-Frame-Options', 'DENY')
     handler.send_header('Referrer-Policy', 'same-origin')
-    handler.send_header(_CSP_HEADER_NAME, _build_csp_enforced_policy(extra_connect_src))
+    handler.send_header(
+        'Content-Security-Policy',
+        "default-src 'self' https://*.cloudflareaccess.com; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+        "img-src 'self' data: https: blob:; font-src 'self' data: https://cdn.jsdelivr.net https://fonts.gstatic.com; connect-src 'self' https://cdn.jsdelivr.net; "
+        "manifest-src 'self' https://*.cloudflareaccess.com; "
+        "base-uri 'self'; form-action 'self'"
+    )
     handler.send_header(
         'Permissions-Policy',
         'camera=(), microphone=(self), geolocation=(), clipboard-write=(self)'
@@ -140,25 +63,6 @@ def _accepts_gzip(handler) -> bool:
         return False
     ae = headers.get('Accept-Encoding', '')
     return 'gzip' in ae
-
-
-def _safe_write(handler, body: bytes) -> None:
-    """Write response body, ignoring expected client disconnect errors.
-
-    Logs disconnects at debug level so they are observable without
-    polluting stdout/stderr during normal operation (SSE reconnects,
-    tab closes, mobile network switches, etc.).
-    """
-    try:
-        handler.end_headers()
-        handler.wfile.write(body)
-    except _CLIENT_DISCONNECT_ERRORS as exc:
-        import logging
-        logging.getLogger("hermes.webui").debug(
-            "Client disconnected mid-response (%s): %s",
-            type(exc).__name__,
-            getattr(handler, "path", "?"),
-        )
 
 
 def j(handler, payload, status: int=200, extra_headers: dict=None) -> None:
@@ -185,7 +89,8 @@ def j(handler, payload, status: int=200, extra_headers: dict=None) -> None:
     if extra_headers:
         for k, v in extra_headers.items():
             handler.send_header(k, v)
-    _safe_write(handler, body)
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
 def t(handler, payload, status: int=200, content_type: str='text/plain; charset=utf-8') -> None:
@@ -196,7 +101,8 @@ def t(handler, payload, status: int=200, content_type: str='text/plain; charset=
     handler.send_header('Content-Length', str(len(body)))
     handler.send_header('Cache-Control', 'no-store')
     _security_headers(handler)
-    _safe_write(handler, body)
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
 MAX_BODY_BYTES = 20 * 1024 * 1024  # 20MB limit for non-upload POST bodies
@@ -431,10 +337,9 @@ def _redact_value(v, *, _enabled: bool | None = None):
 
 
 def redact_session_data(session_dict: dict) -> dict:
-    """Redact credentials from message content, tool data, and session sidecars.
+    """Redact credentials from message content and tool_call data before API response.
 
-    Applies to: messages[], tool_calls[], todo_state, runtime_journal_snapshot,
-    and title.
+    Applies to: messages[], tool_calls[], and title.
     The underlying session file is not modified; redaction is response-layer only.
 
     Reads the ``api_redact_enabled`` setting ONCE for the entire response and
@@ -452,38 +357,13 @@ def redact_session_data(session_dict: dict) -> dict:
         result['messages'] = _redact_value(result['messages'], _enabled=_enabled)
     if 'tool_calls' in result:
         result['tool_calls'] = _redact_value(result['tool_calls'], _enabled=_enabled)
-    if 'todo_state' in result:
-        result['todo_state'] = _redact_value(result['todo_state'], _enabled=_enabled)
-    if 'runtime_journal_snapshot' in result:
-        result['runtime_journal_snapshot'] = _redact_value(
-            result['runtime_journal_snapshot'],
-            _enabled=_enabled,
-        )
     return result
 
 
 def read_body(handler) -> dict:
     """Read and JSON-parse a POST request body (capped at 20MB)."""
-    raw_length = handler.headers.get('Content-Length', 0)
-    try:
-        length = int(raw_length)
-    except (TypeError, ValueError):
-        try:
-            handler.close_connection = True
-        except Exception:
-            pass
-        raise ValueError(f'Invalid Content-Length: {raw_length!r}')
-    if length < 0:
-        try:
-            handler.close_connection = True
-        except Exception:
-            pass
-        raise ValueError(f'Invalid Content-Length: {length}')
+    length = int(handler.headers.get('Content-Length', 0))
     if length > MAX_BODY_BYTES:
-        try:
-            handler.close_connection = True
-        except Exception:
-            pass
         raise ValueError(f'Request body too large ({length} bytes, max {MAX_BODY_BYTES})')
     raw = handler.rfile.read(length) if length else b'{}'
     try:
@@ -503,14 +383,7 @@ def get_profile_cookie_name() -> str:
 
 
 def get_profile_cookie(handler) -> str | None:
-    """Extract and authenticate the active-profile cookie value.
-
-    When WebUI auth is enabled, the profile cookie is treated as an
-    authorization input for profile-scoped routes. Require it to be signed for
-    the current auth session so clients cannot forge ``hermes_profile`` to
-    impersonate another profile. In no-auth deployments, keep the historical
-    plain profile-name cookie behavior.
-    """
+    """Extract the active-profile cookie value from the request, or None."""
     cookie_header = handler.headers.get('Cookie', '')
     if not cookie_header:
         return None
@@ -522,30 +395,16 @@ def get_profile_cookie(handler) -> str | None:
         return None
     cookie_name = get_profile_cookie_name()
     morsel = cookie.get(cookie_name)
-    if not (morsel and morsel.value):
-        return None
-
-    from api.profiles import _PROFILE_ID_RE
-
-    def _valid_profile_name(val: str) -> bool:
-        return val == 'default' or bool(_PROFILE_ID_RE.fullmatch(val))
-
-    raw_val = morsel.value
-    try:
-        from api.auth import is_auth_enabled, parse_cookie, verify_profile_cookie_value
-        if is_auth_enabled():
-            val = verify_profile_cookie_value(raw_val, parse_cookie(handler))
-            return val if val and _valid_profile_name(val) else None
-    except Exception:
-        logger.warning("Failed to verify active profile cookie", exc_info=True)
-        return None
-
-    # No-auth mode: the cookie is a per-browser UI preference, not an authz
-    # boundary, so retain the legacy plain profile-name format.
-    return raw_val if _valid_profile_name(raw_val) else None
+    if morsel and morsel.value:
+        # Validate against profile-name pattern before trusting
+        from api.profiles import _PROFILE_ID_RE
+        val = morsel.value
+        if val == 'default' or _PROFILE_ID_RE.fullmatch(val):
+            return val
+    return None
 
 
-def build_profile_cookie(name: str, handler=None) -> str:
+def build_profile_cookie(name: str) -> str:
     """Build a Set-Cookie header value for the active-profile cookie.
 
     Always persist the selected profile in the cookie, including 'default'.
@@ -560,27 +419,7 @@ def build_profile_cookie(name: str, handler=None) -> str:
     import http.cookies as _hc
     cookie = _hc.SimpleCookie()
     cookie_name = get_profile_cookie_name()
-    value = name
-    # Guard against a future call site silently emitting an UNSIGNED profile
-    # cookie while auth is enabled (which a client could then... not forge, but
-    # it would weaken the binding). If auth is on we require a handler so the
-    # cookie is bound to the session. (#4023 Opus hardening.)
-    try:
-        from api.auth import is_auth_enabled
-        _auth_on = is_auth_enabled()
-    except Exception:
-        _auth_on = False
-    if _auth_on and handler is None:
-        raise RuntimeError("build_profile_cookie requires a request handler when auth is enabled (to bind the profile cookie to the session)")
-    if handler is not None:
-        try:
-            from api.auth import is_auth_enabled, parse_cookie, sign_profile_cookie_value
-            if is_auth_enabled():
-                value = sign_profile_cookie_value(name, parse_cookie(handler))
-        except Exception as exc:
-            logger.warning("Failed to sign active profile cookie", exc_info=True)
-            raise RuntimeError("could not sign active profile cookie") from exc
-    cookie[cookie_name] = value
+    cookie[cookie_name] = name
     cookie[cookie_name]['path'] = '/'
     cookie[cookie_name]['httponly'] = True
     cookie[cookie_name]['samesite'] = 'Lax'

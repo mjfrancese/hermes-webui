@@ -137,8 +137,7 @@ providers:
     assert "custom" not in groups
     assert "lmstudio" in groups
     model_ids = {model["id"] for model in groups["lmstudio"]["models"]}
-    bare_model_ids = {mid.removeprefix("@lmstudio:") for mid in model_ids}
-    assert {"qwen3.6-35b-a3b@q6_k", "second-lmstudio-model"} <= bare_model_ids
+    assert {"qwen3.6-35b-a3b@q6_k", "second-lmstudio-model"} <= model_ids
 
 
 def test_custom_configured_base_url_is_not_reclassified_as_ollama(tmp_path, monkeypatch):

@@ -319,8 +319,7 @@ class TestDraftRecovery:
             f"Error marker should not say 'preserved as a draft', got: {content}"
         )
         assert "Response interrupted" in content
-        assert "live response stream stopped" in content
-        assert "WebUI process restarted" not in content
+        assert "WebUI process restarted" in content
         # The marker now arms the lazy-retry hook when a stream id is known
         # ("Recovering the partial output… reload to retry."). The legacy
         # "user message above was preserved" wording is reserved for the
@@ -625,8 +624,7 @@ class TestNonEmptyMessagesPendingCleared:
         error_msgs = [m for m in s.messages if m.get("_error")]
         assert len(error_msgs) == 1
         assert "Response interrupted" in error_msgs[0]["content"]
-        assert "live response stream stopped" in error_msgs[0]["content"]
-        assert "WebUI process restarted" not in error_msgs[0]["content"]
+        assert "WebUI process restarted" in error_msgs[0]["content"]
         assert error_msgs[0].get("type") == "interrupted"
 
         # Pending fields fully cleared

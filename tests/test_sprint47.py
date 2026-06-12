@@ -23,9 +23,10 @@ def test_skill_commands_are_loaded_from_api_skills_for_autocomplete():
 
 
 def test_builtin_commands_take_precedence_over_skill_slug_collisions():
-    assert "_getReservedSlashCommandSlugs" in COMMANDS_JS
-    assert "if(_getReservedSlashCommandSlugs().has(slug)) return null;" in COMMANDS_JS
-    assert "if(!skill.name.startsWith(q)||seen.has(skill.name)||reserved.has(skill.name))continue;" in COMMANDS_JS
+    # In the combined implementation, REGISTRY (agent registry + WEBUI_ONLY) wins over skills
+    assert ("if(COMMANDS.some(c=>c.name===slug)) return null;" in COMMANDS_JS or
+            "if(REGISTRY.some(c=>c.name===slug)) return null;" in COMMANDS_JS), \
+        "Built-in commands must block skill slug collisions"
 
 
 def test_typing_slash_primes_async_skill_command_loading():

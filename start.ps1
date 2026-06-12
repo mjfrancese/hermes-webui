@@ -159,15 +159,11 @@ $PortFinal = if ($Port) {
 }
 $env:HERMES_WEBUI_HOST = $BindHostFinal
 $env:HERMES_WEBUI_PORT = "$PortFinal"
-if (-not $env:HERMES_HOME) {
-    if ($env:LOCALAPPDATA) {
-        $env:HERMES_HOME = Join-Path $env:LOCALAPPDATA 'hermes'
-    } else {
-        $env:HERMES_HOME = Join-Path $env:USERPROFILE '.hermes'
-    }
-}
 if (-not $env:HERMES_WEBUI_STATE_DIR) {
-    $env:HERMES_WEBUI_STATE_DIR = Join-Path $env:HERMES_HOME 'webui'
+    $env:HERMES_WEBUI_STATE_DIR = Join-Path $env:USERPROFILE '.hermes\webui'
+}
+if (-not $env:HERMES_HOME) {
+    $env:HERMES_HOME = Join-Path $env:USERPROFILE '.hermes'
 }
 
 # === Ensure dirs exist =================================================

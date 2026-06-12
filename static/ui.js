@@ -1,11 +1,4 @@
-// `todos` is the single source of truth for the Todos panel.  Any update
-// goes through the `todo_state` SSE event (live) or session.todo_state
-// (cold-load).  `todoStateMeta` doubles as a sentinel: while it is null
-// no explicit signal has been seen, so loadTodos() falls back to the
-// legacy reverse-scan over S.messages — that keeps new clients working
-// against old servers (Phase 1 may not yet be deployed everywhere).
-// See api/todo_state.py for the wire contract.
-const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',activeProfileIsDefault:true,showHiddenWorkspaceFiles:false,todos:[],todoStateMeta:null};
+const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',showHiddenWorkspaceFiles:false};
 
 function assistantDisplayName(){
   if(S.activeProfile&&S.activeProfile!=='default') return S.activeProfile.charAt(0).toUpperCase()+S.activeProfile.slice(1);
@@ -93,57 +86,12 @@ async function checkOfflineRecoveryNow(){
     _setOfflineChecking(true);
     const ok=await _probeOfflineRecovery();
     _setOfflineChecking(false);
-    if(ok){_stopOfflineProbeTimer();await _recoverFromOfflineSoftly();return true;}
+    if(ok){_stopOfflineProbeTimer();window.location.reload();return true;}
     showOfflineBanner('network');
     return false;
   })();
   try{return await _offlineProbePromise;}
   finally{_offlineProbePromise=null;}
-}
-// Recover from a transient "Connection lost" without a full page reload.
-//
-// The offline banner fires whenever a fetch/SSE errors — which Android does
-// aggressively every time the PWA is backgrounded, even for a second. The old
-// behaviour here was `window.location.reload()`: a hard cold boot that re-runs
-// the whole app and re-pulls /api/sessions + /api/session, producing the
-// multi-second "reload to see the conversation I was just in" flash on every
-// resume. The reload was also intermittent (only when a request actually
-// errored that time), matching the reported "sometimes it reloads, sometimes
-// it doesn't".
-//
-// The server keeps the agent running and buffers stream events while no
-// subscriber is attached (#2307), so a hard reload is never required to
-// recover — we just need to reattach. This does the soft path: hide the
-// banner, restart the gateway SSE (bfcache/background kills the connection),
-// and re-fetch the active session so any messages that landed while we were
-// away appear. A full reload is the fallback only if the soft path throws.
-async function _recoverFromOfflineSoftly(){
-  try{
-    _hideOfflineBanner();
-    if(typeof startGatewaySSE==='function') startGatewaySSE();
-    if(S.session && typeof refreshSession==='function'){
-      await refreshSession();
-    }
-    // After refreshSession() sets S.activeStreamId, reattach if a stream is live.
-    // The server buffers events while no subscriber is attached (#2307/#3863).
-    const sid=S.session&&S.session.session_id;
-    const streamId=S.session&&S.session.active_stream_id;
-    if(sid&&streamId&&typeof attachLiveStream==='function'){
-      let status=null;
-      try{
-        status=await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`);
-      }catch(_){/* stream status check failed — leave session refreshed but don't reattach */}
-      // Outside the probe's catch so an attachLiveStream throw reaches the
-      // outer fallback (hard reload) instead of being silently swallowed.
-      if(status&&status.active) attachLiveStream(sid,streamId,S.session.pending_attachments||[],{reconnecting:true});
-    }
-    return true;
-  }catch(_){
-    // Soft reattach failed (server mid-restart, session gone, etc.) — fall
-    // back to the original hard reload so the user is never stuck offline.
-    window.location.reload();
-    return false;
-  }
 }
 function _isAbortError(e){return !!(e&&(e.name==='AbortError'||e.code===20));}
 function _patchOfflineFetch(){
@@ -176,52 +124,14 @@ function _getSessionQueue(sid, create=false){
   if(!SESSION_QUEUES[sid]&&create) SESSION_QUEUES[sid]=[];
   return SESSION_QUEUES[sid]||[];
 }
-function _queueStorageKey(sid){
-  return 'hermes-queue-'+sid;
-}
-function _clearPersistedSessionQueue(sid){
-  if(!sid) return;
-  const key=_queueStorageKey(sid);
-  try{sessionStorage.removeItem(key);}catch(_){}
-  try{localStorage.removeItem(key);}catch(_){}
-}
-function _persistSessionQueueStorage(sid, queue){
-  if(!sid) return;
-  const q=Array.isArray(queue)?queue:[];
-  if(!q.length){_clearPersistedSessionQueue(sid);return;}
-  const key=_queueStorageKey(sid);
-  let payload='[]';
-  try{payload=JSON.stringify(q);}catch(_){return;}
-  try{sessionStorage.setItem(key,payload);}catch(_){}
-  try{localStorage.setItem(key,payload);}catch(_){}
-}
-function _readPersistedSessionQueue(sid){
-  if(!sid) return [];
-  const key=_queueStorageKey(sid);
-  const read=(store)=>{
-    try{
-      const raw=store&&store.getItem?store.getItem(key):null;
-      if(!raw) return null;
-      const parsed=JSON.parse(raw);
-      return Array.isArray(parsed)?parsed:null;
-    }catch(_){return null;}
-  };
-  const sessionValue=read(sessionStorage);
-  if(sessionValue&&sessionValue.length) return sessionValue;
-  const localValue=read(localStorage);
-  if(localValue&&localValue.length){
-    try{sessionStorage.setItem(key,JSON.stringify(localValue));}catch(_){}
-    return localValue;
-  }
-  return [];
-}
 function queueSessionMessage(sid, payload){
   if(!sid||!payload) return 0;
   const q=_getSessionQueue(sid,true);
   // Stamp created_at so the restore path can detect stale entries (agent already responded)
   const entry={...payload, _queued_at: Date.now()};
   q.push(entry);
-  _persistSessionQueueStorage(sid,q);
+  // Persist to sessionStorage so the queue survives page refresh
+  try{ sessionStorage.setItem('hermes-queue-'+sid, JSON.stringify(q)); }catch(_){}
   return q.length;
 }
 function shiftQueuedSessionMessage(sid){
@@ -230,9 +140,9 @@ function shiftQueuedSessionMessage(sid){
   const next=q.shift();
   if(!q.length){
     delete SESSION_QUEUES[sid];
-    _clearPersistedSessionQueue(sid);
+    try{ sessionStorage.removeItem('hermes-queue-'+sid); }catch(_){}
   } else {
-    _persistSessionQueueStorage(sid,q);
+    try{ sessionStorage.setItem('hermes-queue-'+sid, JSON.stringify(q)); }catch(_){}
   }
   return next;
 }
@@ -355,47 +265,9 @@ function _statusCardHtml(card){
 const MESSAGE_RENDER_WINDOW_DEFAULT=50;
 let _messageRenderWindowSid=null;
 let _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
-// Cached visWithIdx array — invalidated when S.messages.length changes.
-let _visWithIdxCache=null;
-let _visWithIdxCacheLen=0;
-let _visWithIdxCacheSrc=null;  // S.messages reference — detects wholesale replacement with same length
-function clearVisibleMessageRowCache(){
-  _visWithIdxCache=null;
-  _visWithIdxCacheLen=0;
-  _visWithIdxCacheSrc=null;
-}
 function _resetMessageRenderWindow(sid){
   _messageRenderWindowSid=sid||null;
   _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
-  _clearRenderCache();
-  clearVisibleMessageRowCache();
-}
-
-// ── renderMd / _renderUserFencedBlocks cache ──────────────────────────────
-// Long sessions re-render the same messages on every renderMessages() call.
-// Cache the rendered HTML so unchanged messages skip the expensive regex
-// pipeline entirely.  ~95% of messages are identical between renders.
-const _renderCache = new Map();
-const _renderCacheMax = 300;
-function _clearRenderCache(){ _renderCache.clear(); }
-function _renderCacheKey(text, isUser){
-  const p = isUser ? 'u' : 'a';
-  // Short content: use the full string as key (cheap Map lookup).
-  // Long content: length + prefix + suffix is good enough — collisions on
-  // 20-char prefix+suffix are vanishingly rare for chat messages.
-  if(text.length <= 500) return p + ':' + text;
-  return p + ':' + text.length + ':' + text.slice(0,20) + ':' + text.slice(-20);
-}
-function _getCachedRender(text, isUser){
-  const key = _renderCacheKey(text, isUser);
-  const hit = _renderCache.get(key);
-  if(hit !== undefined) return hit;
-  const rendered = isUser
-    ? _renderUserFencedBlocks(text)
-    : renderMd(_stripXmlToolCallsDisplay(String(text)));
-  if(_renderCache.size > _renderCacheMax) _renderCache.clear();
-  _renderCache.set(key, rendered);
-  return rendered;
 }
 function _currentMessageRenderWindowSize(){
   return Math.max(
@@ -408,10 +280,9 @@ function _messageRenderableMessageCount(){
   for(const m of (S.messages||[])){
     if(!m||!m.role||m.role==='tool') continue;
     if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) continue;
-    if(_isRecoveryControlMessage(m)) continue;
     const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
     const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-    if(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)||_assistantMessageHasVisibleContent(m)))) count++;
+    if(msgContent(m)||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)))) count++;
   }
   return count;
 }
@@ -470,18 +341,9 @@ async function jumpToSessionStart(){
   _messageUserUnpinned=true;
   _programmaticScroll=true;
   try{
-    // During active streaming, skip full message load — API response won't
-    // include live messages from the current turn, and replacing S.messages
-    // would lose user/assistant/tool messages.
-    if(!(S.busy||S.activeStreamId)){
-      if(typeof _ensureAllMessagesLoaded==='function') await _ensureAllMessagesLoaded();
-    }
+    if(typeof _ensureAllMessagesLoaded==='function') await _ensureAllMessagesLoaded();
     _messageRenderWindowSize=Math.max(_currentMessageRenderWindowSize(),_messageRenderableMessageCount());
-    // During streaming, skip renderMessages — it rebuilds the DOM but tool card
-    // insertion is blocked by !S.busy, losing Activity until "done" fires.
-    if(!(S.busy||S.activeStreamId)){
-      renderMessages({ preserveScroll:true });
-    }
+    renderMessages({ preserveScroll:true });
     requestAnimationFrame(()=>{
       container.scrollTop=0;
       _updateSessionStartJumpButton();
@@ -497,12 +359,11 @@ function _userMessageDomId(rawIdx){
   return `msg-user-${rawIdx}`;
 }
 
-function _questionJumpButtonHtml(questionRawIdx, assistantRawIdx){
+function _questionJumpButtonHtml(questionRawIdx){
   if(typeof questionRawIdx!=='number'||questionRawIdx<0) return '';
-  const label=t('jump_to_question')||'Response';
-  const title=t('jump_to_question_label')||'Jump to the start of this response';
-  const aIdx=(typeof assistantRawIdx==='number'&&assistantRawIdx>=0)?assistantRawIdx:-1;
-  return `<button class="msg-question-jump-btn" type="button" title="${esc(title)}" aria-label="${esc(title)}" onclick="jumpToTurnQuestion(${questionRawIdx},${aIdx})"><span aria-hidden="true">↑</span><span>${esc(label)}</span></button>`;
+  const label=t('jump_to_question')||'Question';
+  const title=t('jump_to_question_label')||'Jump to the question for this response';
+  return `<button class="msg-question-jump-btn" type="button" title="${esc(title)}" aria-label="${esc(title)}" onclick="jumpToTurnQuestion(${questionRawIdx})"><span aria-hidden="true">↑</span><span>${esc(label)}</span></button>`;
 }
 
 function _highlightQuestionRow(row){
@@ -513,25 +374,10 @@ function _highlightQuestionRow(row){
   window.setTimeout(()=>row.classList.remove('msg-question-highlight'),1800);
 }
 
-async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
+async function jumpToTurnQuestion(questionRawIdx){
   const container=$('messages');
   if(!container||typeof questionRawIdx!=='number'||questionRawIdx<0) return;
   const scrollToTarget=()=>{
-    const hasAssistant=typeof assistantRawIdx==='number'&&assistantRawIdx>=0;
-    if(hasAssistant){
-      // A single assistant rawIdx can render multiple segment nodes — some hidden
-      // (assistant-segment-worklog-source / assistant-segment-anchor are display:none).
-      // scrollIntoView() on a hidden node silently no-ops, so only treat a VISIBLE
-      // segment (getClientRects().length>0) as a successful target; otherwise fall
-      // through to the question-row fallback rather than suppressing it. (#3934)
-      const segs=container.querySelectorAll('[data-msg-idx="'+assistantRawIdx+'"]');
-      for(const seg of segs){
-        if(seg.getClientRects().length>0){
-          seg.scrollIntoView({block:'start',behavior:'smooth'});
-          return true;
-        }
-      }
-    }
     const row=document.getElementById(_userMessageDomId(questionRawIdx));
     if(!row) return false;
     row.scrollIntoView({block:'center',behavior:'smooth'});
@@ -596,7 +442,7 @@ async function refreshDashboardStatus(force=false){
     return _dashboardStatusCache;
   }
   try{
-    const status=await api('/api/dashboard/status',{timeoutToast:false});
+    const status=await api('/api/dashboard/status');
     _dashboardStatusCache=status||{running:false};
   }catch(_){
     _dashboardStatusCache={running:false};
@@ -651,31 +497,7 @@ if(document.readyState==='complete'){
 }
 
 /* ── Image lightbox — click any .msg-media-img to enlarge ─────────────────── */
-function _openImgLightbox(imgEl) {
-  if(!imgEl || !imgEl.src) return;
-  const src=imgEl.src, alt=imgEl.alt||'';
-  // Find sibling images in the same message for prev/next navigation.
-  // Walk up from the clicked image to find the message container, then
-  // collect all .msg-media-img within it.
-  // Composer attach-tray chips bypass sibling detection — each chip click
-  // opens a single-image lightbox (no navigation between staged uploads).
-  let allImages = [];
-  let startIndex = 0;
-  if(!imgEl.closest('.attach-tray')){
-    let container = imgEl.closest('.msg-row, .assistant-turn-blocks, .assistant-turn, .user-turn');
-    if(!container) container = imgEl.parentElement;
-    if(container){
-      const siblings = container.querySelectorAll('.msg-media-img');
-      if(siblings.length>1){
-        allImages = Array.from(siblings);
-        startIndex = allImages.indexOf(imgEl);
-        if(startIndex===-1) startIndex=0;
-      }
-    }
-  }
-  _openImgLightboxWithNav(src, alt, allImages, startIndex);
-}
-function _openImgLightboxWithNav(src, alt, images, index) {
+function _openImgLightbox(src, alt) {
   const lb = document.createElement('div');
   lb.className = 'img-lightbox';
   lb.setAttribute('role', 'dialog');
@@ -691,94 +513,31 @@ function _openImgLightboxWithNav(src, alt, images, index) {
   cls.onclick = () => _closeImgLightbox(lb);
   lb.appendChild(img);
   lb.appendChild(cls);
-  // Prev/Next navigation — store index and images on lb so a single set of
-  // handlers reads live values without closure churn on every nav.
-  lb._navIndex = index;
-  lb._navImages = (images && images.length>1) ? images : null;
-  if(lb._navImages){
-    const prevBtn = document.createElement('button');
-    prevBtn.className = 'img-lightbox-nav img-lightbox-nav-prev';
-    prevBtn.setAttribute('aria-label', 'Previous image');
-    prevBtn.innerHTML = '‹';
-    prevBtn.onclick = e => { e.stopPropagation(); _navigateLightbox(lb, -1); };
-    lb.appendChild(prevBtn);
-    const nextBtn = document.createElement('button');
-    nextBtn.className = 'img-lightbox-nav img-lightbox-nav-next';
-    nextBtn.setAttribute('aria-label', 'Next image');
-    nextBtn.innerHTML = '›';
-    nextBtn.onclick = e => { e.stopPropagation(); _navigateLightbox(lb, 1); };
-    lb.appendChild(nextBtn);
-    lb._counterEl = document.createElement('div');
-    lb._counterEl.className = 'img-lightbox-counter';
-    lb.appendChild(lb._counterEl);
-    lb._counterEl.textContent = (index+1) + ' / ' + images.length;
-  }
   lb.onclick = () => _closeImgLightbox(lb);
   document.body.appendChild(lb);
-  // Single keyboard handler — reads lb._navX live, no remove/add churn.
-  lb._keyHandler = e => {
-    if(e.key==='Escape'){ _closeImgLightbox(lb); return; }
-    if(lb._navImages){
-      if(e.key==='ArrowLeft'){ e.preventDefault(); _navigateLightbox(lb, -1); }
-      if(e.key==='ArrowRight'){ e.preventDefault(); _navigateLightbox(lb, 1); }
-    }
-  };
-  document.addEventListener('keydown', lb._keyHandler);
-}
-function _navigateLightbox(lb, direction) {
-  const images = lb._navImages;
-  if(!images) return;
-  const newIndex = lb._navIndex + direction;
-  if(newIndex<0 || newIndex>=images.length) return;
-  lb._navIndex = newIndex;
-  const nextImg = images[newIndex];
-  const lbImg = lb.querySelector('img');
-  if(!lbImg) return;
-  lbImg.src = nextImg.src;
-  lbImg.alt = nextImg.alt || '';
-  lb.setAttribute('aria-label', nextImg.alt || 'Image');
-  // Update counter via stored reference — no DOM query.
-  if(lb._counterEl) lb._counterEl.textContent = (newIndex+1) + ' / ' + images.length;
+  // Close on Escape
+  lb._escHandler = e => { if(e.key==='Escape') _closeImgLightbox(lb); };
+  document.addEventListener('keydown', lb._escHandler);
 }
 function _closeImgLightbox(lb) {
   if(!lb || !lb.parentNode) return;
-  document.removeEventListener('keydown', lb._keyHandler);
+  document.removeEventListener('keydown', lb._escHandler);
   lb.style.animation = 'lb-in .12s ease reverse';
   setTimeout(() => lb.parentNode && lb.parentNode.removeChild(lb), 120);
 }
 
 document.addEventListener('click', e => {
   if(!e.target || !e.target.closest) return;
-  const sessionLink=e.target.closest('a.session-link[href]');
-  if(sessionLink){
-    const href=sessionLink.getAttribute('href')||'';
-    const m=href.match(/(?:^|\/)session\/([^?#]+)/i);
-    if(m&&typeof loadSession==='function'){
-      e.preventDefault();
-      try{loadSession(decodeURIComponent(m[1]));}catch(_){loadSession(m[1]);}
-    }
-    return;
-  }
-  const workspaceLink=e.target.closest('a[href^="#workspace="]');
-  if(workspaceLink){
-    e.preventDefault();
-    const href=workspaceLink.getAttribute('href')||'';
-    try{
-      const rel=decodeURIComponent(href.slice('#workspace='.length));
-      if(rel && typeof openArtifactPath==='function') openArtifactPath(rel);
-    }catch(_){}
-    return;
-  }
   // Message-attached images (already wired since v0.50.x).
   let img = e.target.closest('.msg-media-img');
-  if(img){ _openImgLightbox(img); return; }
+  if(img){ _openImgLightbox(img.src, img.alt); return; }
   // Composer attach-tray image thumbnails — click any pasted/dropped image
   // chip to lightbox-zoom it before sending. Excludes audio/video chips,
   // which keep their inline media controls. SVG thumbnails (.attach-thumb--svg)
   // are still images visually, so they qualify.
   img = e.target.closest('.attach-thumb');
   if(img && img.tagName === 'IMG'){
-    _openImgLightbox(img);
+    _openImgLightbox(img.src, img.alt || img.title || 'Attached image');
     return;
   }
 });
@@ -1020,61 +779,6 @@ function _modelStateForSelect(sel, modelId){
   const provider=String(_getOptionProviderId(opt)||'').trim();
   return {model:value,model_provider:(provider&&provider!=='default')?provider:null};
 }
-function _captureModelDropdownSelection(sel){
-  if(!sel||!sel.value) return null;
-  try{
-    const state=_modelStateForSelect(sel,sel.value);
-    if(state&&state.model) return state;
-  }catch(_){}
-  return {model:String(sel.value||''),model_provider:null};
-}
-function _modelProviderForSend(modelId){
-  const sessionProvider=(S&&S.session&&S.session.model_provider)||null;
-  if(sessionProvider) return sessionProvider;
-  const model=String(modelId||'').trim();
-  if(!model) return null;
-  const explicitProvider=typeof _providerFromModelValue==='function'
-    ? _providerFromModelValue(model)
-    : '';
-  if(explicitProvider) return explicitProvider;
-  const sel=typeof $==='function' ? $('modelSelect') : null;
-  if(sel&&String(sel.value||'').trim()===model&&typeof _modelStateForSelect==='function'){
-    try{
-      const dropdownState=_modelStateForSelect(sel,sel.value);
-      if(dropdownState&&String(dropdownState.model||'').trim()===model){
-        return dropdownState.model_provider||null;
-      }
-    }catch(_){}
-  }
-  if(typeof _readPersistedModelState==='function'){
-    try{
-      const persisted=_readPersistedModelState();
-      if(persisted&&String(persisted.model||'').trim()===model){
-        return persisted.model_provider||null;
-      }
-    }catch(_){}
-  }
-  return null;
-}
-function _reconcileModelDropdownSelection(sel,data,previousState,opts){
-  if(!sel) return null;
-  const activeSession=(typeof S!=='undefined'&&S&&S.session)?S.session:null;
-  // Fresh boot is the only path where the profile/server default intentionally
-  // beats a browser-persisted or static fallback value. Every other model-list
-  // rebuild should preserve the loaded session model or the user's current
-  // in-page selection when it still exists in the refreshed catalog.
-  const shouldApplyBootDefault=!!(opts&&opts.preferProfileDefaultOnFreshBoot);
-  if(shouldApplyBootDefault && data&&data.default_model && !(activeSession&&activeSession.model)){
-    return _applyModelToDropdown(data.default_model,sel,data.active_provider||null);
-  }
-  if(activeSession&&activeSession.model){
-    return _applyModelToDropdown(activeSession.model,sel,activeSession.model_provider||null);
-  }
-  if(previousState&&previousState.model){
-    return _applyModelToDropdown(previousState.model,sel,previousState.model_provider||null);
-  }
-  return null;
-}
 function _providerQualifiedModelValueForSelect(sel, modelId){
   return _modelStateForSelect(sel,modelId).model;
 }
@@ -1181,20 +885,6 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
   if(!modelId||!sel) return null;
   const options=Array.from(sel.options);
   const opts=options.map(o=>o.value);
-  // 0. Exact match — highest priority when it doesn't conflict with a
-  // cross-provider preference (#3360, guarded for #1228/#1313).
-  // When all models share the same provider (e.g. a custom proxy),
-  // normalization can collapse distinct multi-slash IDs to the same key
-  // and options.find() returns whichever appears first in the DOM instead
-  // of the exact value.  But when the exact option belongs to a *different*
-  // provider than the preferred one, we must fall through to the provider-
-  // aware match so rehydration doesn't snap to the wrong provider row.
-  if(opts.includes(modelId)){
-    const exactOpt=options.find(o=>o.value===modelId);
-    const exactProv=exactOpt?_getOptionProviderId(exactOpt).toLowerCase():'';
-    const pref=String(preferredProviderId||'').toLowerCase();
-    if(!pref || !exactProv || exactProv===pref) return modelId;
-  }
   // 1. Normalize: lowercase, strip namespace prefix, replace hyphens→dots.
   // Also strip @provider: prefix from deduplicated model IDs (#1228, #1313).
   const norm=s=>s.toLowerCase().replace(/^[^/]+\//,'').replace(/^@([^:]+:)+/,'').replace(/-/g,'.');
@@ -1209,16 +899,10 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
     const providerMatch=options.find(o=>norm(o.value)===target && _getOptionProviderId(o).toLowerCase()===preferred);
     if(providerMatch) return providerMatch.value;
   }
-  // 2. Normalized match
+  // 2. Exact match
+  if(opts.includes(modelId)) return modelId;
   const exact=opts.find(o=>norm(o)===target);
   if(exact) return exact;
-  // If the request is provider-qualified (either explicit @provider:model or
-  // a slash-qualified vendor/model id), do NOT fuzzy-match a sibling model
-  // once exact/provider-aware lookup failed. Returning null lets the caller
-  // preserve the raw typed value instead of snapping to the closest catalog
-  // entry. This keeps uncatalogued models routable instead of silently turning
-  // them into a nearby curated sibling.
-  if(rawModel.startsWith('@')||rawModel.includes('/')) return null;
   // 3. Prefix/substring: require the candidate to start with the FULL normalized target
   // (not a truncated base). This avoids false matches like gpt.5.5 → gpt.5.4.mini (#1188).
   // Only fall back to the shorter base form if target itself is very short (a bare root
@@ -1226,25 +910,7 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
   const base=target.replace(/\.\d+$/,'');  // strip trailing version number
   const useBase=base.length<=4||base===target; // bare root — stripping changed nothing meaningful
   const prefixTarget=useBase?base:target;
-  // When the typed target is a COMPLETE versioned name (ends in a digit, e.g.
-  // "mimo-v2.5" → norm "mimo.v2.5"), a prefix hit on a longer option is only
-  // legitimate if the extra text continues the VERSION ("." + digit, e.g.
-  // mimo.v2 → mimo.v2.5...). If the extra text is a variant/tier suffix
-  // ("." + non-digit, e.g. mimo.v2.5.pro from "mimo-v2.5-pro"), the user asked
-  // for the base model that simply isn't in the catalog — do NOT silently snap
-  // them to the -pro/-flash tier (and a different price tier). Let resolution
-  // fall through to null so the caller reports no-match instead. (#3368)
-  const targetEndsInVersion=/\d$/.test(target);
-  const partial=opts.find(o=>{
-    const no=norm(o);
-    if(!no.startsWith(prefixTarget)) return false;
-    if(targetEndsInVersion && no!==target){
-      const rest=no.slice(target.length);
-      // reject "." + non-digit (variant/tier suffix); allow "" or "." + digit (version continuation)
-      if(rest && !/^\.\d/.test(rest)) return false;
-    }
-    return true;
-  });
+  const partial=opts.find(o=>norm(o).startsWith(prefixTarget));
   return partial||null;
 }
 
@@ -1274,14 +940,11 @@ function _ensureModelOptionInDropdown(modelId, sel, preferredProviderId){
   if(!modelId||!sel) return null;
   const applied=_applyModelToDropdown(modelId,sel,preferredProviderId);
   if(applied) return applied;
-  const value=modelId;
   const opt=document.createElement('option');
   opt.value=modelId;
   opt.textContent=typeof getModelLabel==='function'?getModelLabel(modelId):modelId;
   opt.dataset.custom='1';
-  const badge=(window._configuredModelBadges||{})[value];
-  if(badge&&badge.provider) opt.dataset.provider=badge.provider;
-  const provider=preferredProviderId||(badge&&badge.provider)||_providerFromModelValue(modelId)||'';
+  const provider=preferredProviderId||_providerFromModelValue(modelId)||'';
   if(provider) opt.dataset.provider=provider;
   sel.appendChild(opt);
   sel.value=modelId;
@@ -1325,7 +988,7 @@ function _applySessionModelFallback(sel){
   return null;
 }
 
-async function populateModelDropdown(opts={}){
+async function populateModelDropdown(){
   const sel=$('modelSelect');
   if(!sel) return;
   try{
@@ -1383,7 +1046,6 @@ async function populateModelDropdown(opts={}){
       : _synthGroupsFromConfigured();
 
     if(!groups.length) return; // no server groups and no configured fallback
-    const previousSelection=_captureModelDropdownSelection(sel);
     // Clear existing options
     sel.innerHTML='';
     _dynamicModelLabels={};
@@ -1416,7 +1078,12 @@ async function populateModelDropdown(opts={}){
       }
       sel.appendChild(og);
     }
-    _reconcileModelDropdownSelection(sel,data,previousSelection,opts);
+    // Set default model from server on fresh/blank boot. Loaded sessions keep
+    // their own persisted model and apply it via loadSession(). Do not let stale
+    // browser localStorage suppress the profile default.
+    if(data.default_model && !(S.session&&S.session.model)){
+      _applyModelToDropdown(data.default_model, sel, data.active_provider||null);
+    }
     if(typeof syncModelChip==='function') syncModelChip();
     const dd=$('composerModelDropdown');
     if(dd&&dd.classList.contains('open')&&typeof renderModelDropdown==='function'){
@@ -1455,22 +1122,14 @@ function _addLiveModelsToSelect(provider, models, sel){
   if(!providerGroup){
     providerGroup=document.createElement('optgroup');
     providerGroup.label=provider.charAt(0).toUpperCase()+provider.slice(1)+' (live)';
-    providerGroup.dataset.provider=provider;
     sel.appendChild(providerGroup);
-  }else if(!providerGroup.dataset.provider){
-    providerGroup.dataset.provider=provider;
   }
   const existingIds=new Set([...sel.options].map(o=>o.value));
-  // Normalized dedup strips provider/custom prefixes and namespaces (#907, #3478).
+  // Normalized dedup: strip one @provider: prefix and namespace so
+  // 'minimax/minimax-m2.7' matches '@nous:minimax/minimax-m2.7' (#907).
   const _normId=id=>{
     let s=String(id||'');
-    if(s.startsWith('@')&&s.includes(':')){
-      if(s.startsWith('@custom:')){
-        s=s.substring(s.lastIndexOf(':')+1)||s;
-      }else{
-        s=s.substring(s.indexOf(':')+1);
-      }
-    }
+    if(s.startsWith('@')&&s.includes(':')) s=s.substring(s.indexOf(':')+1);
     s=s.split('/').pop();
     return s.replace(/-/g,'.').toLowerCase();
   };
@@ -1491,7 +1150,6 @@ function _addLiveModelsToSelect(provider, models, sel){
     opt.value=mid;
     opt.textContent=m.label||m.id;
     opt.title='Live model — fetched from provider';
-    opt.dataset.provider=provider;
     providerGroup.appendChild(opt);
     _dynamicModelLabels[mid]=m.label||m.id;
     added++;
@@ -1579,26 +1237,7 @@ function _normalizeConfiguredModelKey(modelId){
   // Defensive: trailing-colon / trailing-slash falls back to the original key
   // so malformed configs don't collapse distinct ids to '' (matches backend _norm_model_id).
   if(s.startsWith('@')&&s.includes(':')){const last=s.split(':').pop();s=last||s;}
-  // Skip slash-based stripping for URI-scheme IDs (e.g. gpt://folder/model)
-  // whose slashes are path separators, not provider delimiters (#3429).
-  const _hasScheme=/^[a-z][a-z0-9+.-]*:\/\//i.test(s);
-  if(!_hasScheme){
-    // Strip provider-qualified prefixes that contain colons before the first
-    // slash (e.g. 'custom:llm-proxy/model' → 'model').  Without this, badge-
-    // key variants like 'custom:llm-proxy/opencode_go/deepseek-v4-pro' and the
-    // bare 'opencode_go/deepseek-v4-pro' produce different normalized keys and
-    // aren't deduped in the configured section (#3360).
-    if(s.includes('/')&&s.indexOf(':')!==-1&&s.indexOf(':')<s.indexOf('/')){
-      s=s.slice(s.indexOf('/')+1)||s;
-    }
-    // Strip only the first slash-segment (provider prefix), preserving any
-    // remaining vendor hierarchy. Using split('/').pop() here previously
-    // discarded ALL segments except the last, collapsing distinct multi-slash
-    // IDs like 'vendor_a/deepseek-v4-pro' and 'vendor_b/deepseek/deepseek-v4-pro'
-    // to the same key, causing badge misattribution and configured-entry
-    // suppression (#3360).
-    if(s.includes('/')) s=s.replace(/^[^/]+\//, '')||s;
-  }
+  if(s.includes('/')){const last=s.split('/').pop();s=last||s;}
   return s.replace(/-/g,'.');
 }
 
@@ -1816,7 +1455,7 @@ function renderModelDropdown(){
         }
         const badgeHtml=m.badge?`<span class="model-opt-badge model-opt-badge--${esc(m.badge.role||'configured')}">${esc(badgeLabel)}</span>`:'';
         row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(modelName)}</span>${badgeHtml}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-        row.onclick=()=>selectModelFromDropdown(m.value,(m.badge&&m.badge.provider)||m.providerId||null);
+        row.onclick=()=>selectModelFromDropdown(m.value);
         dd.appendChild(row);
       }
     }
@@ -1855,7 +1494,7 @@ function renderModelDropdown(){
       // Inline provider chip on every row that has a group (#1425)
       const providerChip=m.group?`<span class="model-opt-provider">${esc(m.group)}</span>`:'';
       row.innerHTML=`<div class="model-opt-top"><span class="model-opt-name">${esc(m.name)}</span>${badgeHtml}${providerChip}</div><span class="model-opt-id">${esc(m.id)}</span>`;
-      row.onclick=()=>selectModelFromDropdown(m.value,m.providerId||(m.badge&&m.badge.provider)||null);
+      row.onclick=()=>selectModelFromDropdown(m.value);
       dd.appendChild(row);
     }
     // Show "No results" if filtered and nothing matched
@@ -1873,31 +1512,7 @@ function renderModelDropdown(){
   };
   // Event handlers for search input
   _si.addEventListener('input',()=>_filterModels(_si.value));
-  // Keyboard navigation through filtered model rows (#2791).
-  const _visibleModelRows=()=>Array.from(dd.querySelectorAll('.model-opt'));
-  const _activeRowIndex=(rows)=>rows.findIndex(r=>r.classList.contains('is-highlighted'));
-  const _highlightRow=(rows,idx)=>{
-    for(const r of rows) r.classList.remove('is-highlighted');
-    if(idx<0||idx>=rows.length) return;
-    const row=rows[idx];
-    row.classList.add('is-highlighted');
-    if(typeof row.scrollIntoView==='function') row.scrollIntoView({block:'nearest'});
-  };
-  _si.addEventListener('keydown',e=>{
-    if(e.key==='Escape'){closeModelDropdown();return;}
-    if(e.key==='ArrowDown'||e.key==='ArrowUp'||e.key==='Enter'){
-      const rows=_visibleModelRows();
-      if(!rows.length){if(e.key==='Enter') e.preventDefault();return;}
-      const cur=_activeRowIndex(rows);
-      if(e.key==='ArrowDown'){e.preventDefault();_highlightRow(rows,cur<0?0:Math.min(rows.length-1,cur+1));return;}
-      if(e.key==='ArrowUp'){e.preventDefault();_highlightRow(rows,cur<=0?rows.length-1:cur-1);return;}
-      if(e.key==='Enter'){
-        e.preventDefault();
-        const pick=cur>=0?rows[cur]:rows[0];
-        if(pick) pick.click();
-      }
-    }
-  });
+  _si.addEventListener('keydown',e=>{if(e.key==='Enter') {e.preventDefault();}if(e.key==='Escape') {closeModelDropdown();}});
   _si.addEventListener('click',e=>e.stopPropagation());
   // Event handlers for clear button
   _sc.onclick=()=>{ _si.value=''; _filterModels(''); _si.focus(); };
@@ -1917,23 +1532,22 @@ function renderModelDropdown(){
 }
 
 async function selectModelFromDropdown(value){
-  const preferredProviderId=arguments[1];
   const sel=$('modelSelect');
-  if(!sel) { closeModelDropdown(); return; }
-  const provider=String(preferredProviderId||'').trim()||null;
-  const currentState=(typeof _modelStateForSelect==='function')
-    ? _modelStateForSelect(sel, sel.value)
-    : {model:sel.value,model_provider:null};
-  const sameModel=String(currentState.model||'')===String(value||'');
-  const sameProvider=String(currentState.model_provider||'')===String(provider||'');
-  if(sameModel&&sameProvider){ closeModelDropdown(); return; }
-  // Resolve the provider-specific option so duplicate bare IDs (e.g. gpt-5.5
-  // under OpenAI Codex vs OpenRouter) update session model_provider correctly.
-  if(typeof _ensureModelOptionInDropdown==='function'){
-    _ensureModelOptionInDropdown(value, sel, provider);
-  }else{
-    sel.value=value;
+  if(!sel||sel.value===value) { closeModelDropdown(); return; }
+  // If the value isn't in the option list (custom model ID), add a temporary option
+  // so sel.value assignment succeeds and the model chip shows the custom ID.
+  if(!Array.from(sel.options).some(o=>o.value===value)){
+    const opt=document.createElement('option');
+    opt.value=value;
+    opt.textContent=getModelLabel(value);
+    opt.dataset.custom='1';
+    const badge=(window._configuredModelBadges||{})[value];
+    if(badge&&badge.provider) opt.dataset.provider=badge.provider;
+    // Remove any previous custom option before adding new one
+    sel.querySelectorAll('option[data-custom]').forEach(o=>o.remove());
+    sel.appendChild(opt);
   }
+  sel.value=value;
   syncModelChip();
   closeModelDropdown();
   if(typeof sel.onchange==='function') await sel.onchange();
@@ -1992,7 +1606,6 @@ window.addEventListener('resize',()=>{
 
 // ── Reasoning effort chip ────────────────────────────────────────────────────
 let _currentReasoningEffort=null;
-let _currentReasoningEffortsSupported=null;
 
 function _normalizeReasoningEffort(eff){
   return String(eff||'').trim().toLowerCase();
@@ -2004,70 +1617,17 @@ function _formatReasoningEffortLabel(effort){
   return effort;
 }
 
-function _reasoningEffortContext(){
-  const sel=$('modelSelect');
-  const model=(S&&S.session&&S.session.model)||(sel&&sel.value)||'';
-  let provider=(S&&S.session&&S.session.model_provider)||'';
-  if(!provider&&sel&&model&&typeof _modelStateForSelect==='function'){
-    provider=_modelStateForSelect(sel, model).model_provider||'';
-  }
-  const ctx={};
-  if(model) ctx.model=model;
-  if(provider) ctx.provider=provider;
-  return ctx;
-}
-
-function _reasoningEffortQuery(){
-  const params=new URLSearchParams(_reasoningEffortContext());
-  const qs=params.toString();
-  return qs?('?'+qs):'';
-}
-
-function _applyReasoningOptions(supportedEfforts){
-  const dd=$('composerReasoningDropdown');
-  if(!dd) return;
-  const supported=new Set(Array.isArray(supportedEfforts)?supportedEfforts:[]);
-  dd.querySelectorAll('.reasoning-option').forEach(function(opt){
-    const effort=opt.dataset.effort;
-    if(effort==='none'){
-      opt.style.display='';
-      return;
-    }
-    if(!supported.size){
-      opt.style.display='none';
-      return;
-    }
-    opt.style.display=supported.has(effort)?'':'none';
-  });
-}
-
 function _applyReasoningChip(eff){
-  const meta=arguments[1]||null;
   const effort=_normalizeReasoningEffort(eff);
   _currentReasoningEffort=effort;
-  if(meta&&Array.isArray(meta.supported_efforts)){
-    _currentReasoningEffortsSupported=meta.supported_efforts;
-  }
   const wrap=$('composerReasoningWrap');
   const label=$('composerReasoningLabel');
   const chip=$('composerReasoningChip');
   const mobileLabel=$('composerMobileReasoningLabel');
   const mobileAction=$('composerMobileReasoningAction');
   if(!wrap||!label) return;
-  const supportedEfforts=(typeof _currentReasoningEffortsSupported==='undefined')
-    ?null
-    :_currentReasoningEffortsSupported;
-  const supports=Array.isArray(supportedEfforts)
-    ?supportedEfforts.length>0
-    :true;
-  if(!supports){
-    wrap.style.display='none';
-    if(mobileAction) mobileAction.style.display='none';
-    return;
-  }
   wrap.style.display='';
   if(mobileAction) mobileAction.style.display='';
-  if(typeof _applyReasoningOptions==='function') _applyReasoningOptions(supportedEfforts);
   const text=_formatReasoningEffortLabel(effort);
   label.textContent=text;
   if(mobileLabel) mobileLabel.textContent=text;
@@ -2081,13 +1641,14 @@ function _applyReasoningChip(eff){
 }
 
 function fetchReasoningChip(){
-  api('/api/reasoning'+_reasoningEffortQuery()).then(function(st){
-    _applyReasoningChip((st&&st.reasoning_effort)||'', st||{});
-  }).catch(function(){_applyReasoningChip('', {supported_efforts:[]});});
+  api('/api/reasoning').then(function(st){
+    _applyReasoningChip((st&&st.reasoning_effort)||'');
+  }).catch(function(){_applyReasoningChip('');});
 }
 
 function syncReasoningChip(){
-  fetchReasoningChip();
+  if(_currentReasoningEffort===null){fetchReasoningChip();return;}
+  _applyReasoningChip(_currentReasoningEffort);
 }
 
 function _highlightReasoningOption(effort){
@@ -2151,10 +1712,9 @@ document.addEventListener('click',function(e){
     const opt=e.target.closest('.reasoning-option');
     const effort=opt&&opt.dataset.effort;
     if(effort){
-      const payload=Object.assign({effort:effort},_reasoningEffortContext());
-      api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
+      api('/api/reasoning',{method:'POST',body:JSON.stringify({effort:effort})})
         .then(function(st){
-          _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{});
+          _applyReasoningChip((st&&st.reasoning_effort)||effort);
           showToast('🧠 Reasoning effort set to '+((st&&st.reasoning_effort)||effort));
         })
         .catch(function(){showToast('🧠 Failed to set effort');});
@@ -2407,129 +1967,81 @@ window.addEventListener('resize',function(){
 });
 
 // ── Scroll pinning ──────────────────────────────────────────────────────────
-// When streaming, auto-scroll only while the user is following the live tail.
-// Any manual scroll up sets a sticky unpinned flag until the user scrolls back
-// to the bottom (near-bottom hysteresis on downward motion) or clicks ↓.
-// Programmatic scrolls are ignored via _programmaticScroll. Fixes #1469 / #1360 / #1731.
+// When streaming, auto-scroll only if the user hasn't manually scrolled up.
+// Once the user scrolls back to within 250px of the bottom, re-pin.
+// Uses a guard flag to avoid the race where programmatic scrolls (from
+// scrollIfPinned / scrollToBottom) re-set _scrollPinned=true, overriding
+// the user's explicit scroll-up.  Fixes #1469 / #1360.
+// Direction-aware unpin (issue #1731): the hysteresis below is correct
+// for re-pinning (entering the near-bottom zone), but applying it to
+// unpinning stranded users who scrolled up by a small amount inside the
+// 250px zone — every upward sample still landed in the near-bottom
+// region, so the counter kept incrementing and _scrollPinned stayed
+// true. The next streaming token snapped them back. We now track
+// scrollTop direction: an explicit upward movement (scrollTop decreased
+// by more than 2px between samples) unpins immediately and resets the
+// counter, while downward / stationary movement falls through the
+// original hysteresis path so the macOS momentum re-pin protection from
+// #1360 is preserved.
+// rAF-debounced scroll listener (issue #1360): on macOS WKWebView, trackpad
+// momentum scrolling fires scroll events that interleave with the
+// _programmaticScroll setTimeout(0) guard. A mid-momentum scroll event can
+// either get swallowed (_programmaticScroll still true) or falsely report
+// the user is at the bottom (momentum hasn't settled). rAF defers the
+// distance check to the next paint frame when the browser's scroll
+// position has settled. A hysteresis counter requires two consecutive
+// near-bottom samples before re-pinning, preventing accidental re-pin
+// during initial deceleration.
 let _scrollPinned=true;
 let _programmaticScroll=false;
 let _nearBottomCount=0;
 let _lastScrollTop=null;
-// Sticky-unpin model (#3343 supersedes #3330's proximity re-pin): once the user
-// scrolls up, streaming stops auto-following until they return to the bottom or
-// click ↓. The upward-intent TIMEOUT mechanism (_lastMessageUpwardIntentMs /
-// MESSAGE_UPWARD_INTENT_MS) is removed — sticky-unpin makes it unnecessary.
-// Keep the non-message intent timestamp at -Infinity so load-time isn't read as
-// intent (the #3330 follow-up fix); 0 would mark the first NON_MESSAGE_SCROLL_INTENT
-// window after load as suppressed.
-let _lastNonMessageScrollIntentMs=-Infinity;
+let _lastNonMessageScrollIntentMs=0;
+let _lastMessageUpwardIntentMs=0;
 let _messageUserUnpinned=false;
 let _bottomSettleToken=0;
 const NON_MESSAGE_SCROLL_INTENT_SUPPRESS_MS=350;
-let _touchStartY=null;
-let _newMessageCueVisible=false;
+const MESSAGE_UPWARD_INTENT_MS=450;
 function _cancelBottomSettle(){ _bottomSettleToken++; }
 function _recordNonMessageScrollIntent(e){
   const el=document.getElementById('messages');
   const target=e&&e.target;
   if(!el||!target) return;
+  // Streaming token renders should keep pinning the chat only while the user is
+  // actually interacting with the chat pane. A wheel/touch gesture over the
+  // session sidebar (or another independent pane) must not be immediately fought
+  // by scrollIfPinned() writing #messages.scrollTop on the next token (#1784).
   if(!el.contains(target)) _lastNonMessageScrollIntentMs=performance.now();
   else if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY<0)){
+    // User is intentionally moving upward in the transcript. Record the real
+    // input event so later scrollTop decreases caused by layout/windowing do
+    // not masquerade as user intent and strand live streaming away from bottom.
+    _lastMessageUpwardIntentMs=performance.now();
+    // User is intentionally moving in the transcript. Cancel any delayed
+    // scrollToBottom settling that was scheduled by session-load/layout growth.
     _cancelBottomSettle();
     if(typeof e.deltaY==='number'&&e.deltaY<0){
       _messageUserUnpinned=true;
       _nearBottomCount=0;
       _scrollPinned=false;
-    } else if(e.type==='touchmove'&&_touchStartY!==null&&e.touches&&e.touches[0]){
-      // Detect upward-scroll intent on touch: dragging the finger DOWN the
-      // screen scrolls the content up into earlier history (scrollTop
-      // decreases) — the same "user scrolled away" signal the wheel deltaY<0
-      // branch and the scroll listener's movedUp branch use. dy>0 = finger
-      // moved down = reveal earlier content = unpin.
-      const dy=e.touches[0].clientY-_touchStartY;
-      if(dy>8){
-        _messageUserUnpinned=true;
-        _nearBottomCount=0;
-        _scrollPinned=false;
-      }
     }
   }
+}
+function _recentMessageUpwardIntent(){
+  return performance.now()-_lastMessageUpwardIntentMs<MESSAGE_UPWARD_INTENT_MS;
 }
 function _recentNonMessageScrollIntent(){
   return performance.now()-_lastNonMessageScrollIntentMs<NON_MESSAGE_SCROLL_INTENT_SUPPRESS_MS;
 }
-function _setScrollToBottomCueText(btn, textKey, labelKey){
-  if(!btn) return;
-  const label=btn.querySelector('.session-jump-btn__text');
-  if(label){
-    label.setAttribute('data-i18n',textKey);
-    label.textContent=(typeof t==='function')?t(textKey):label.textContent;
-  }
-  btn.setAttribute('data-i18n-aria-label',labelKey);
-  btn.setAttribute('data-i18n-title',labelKey);
-  const accessible=(typeof t==='function')?t(labelKey):btn.getAttribute('aria-label')||'';
-  if(accessible){
-    btn.setAttribute('aria-label',accessible);
-    btn.setAttribute('title',accessible);
-  }
-}
-function _syncScrollToBottomCue(show, opts){
-  const btn=$('scrollToBottomBtn');
-  if(!btn) return;
-  const newMessage=!!(opts&&opts.newMessage);
-  btn.classList.toggle('scroll-to-bottom-btn--new-message',newMessage);
-  if(newMessage) _setScrollToBottomCueText(btn,'session_new_message','session_new_message_label');
-  else _setScrollToBottomCueText(btn,'session_jump_end','session_jump_end_label');
-  btn.style.display=show?'flex':'none';
-}
-function _showNewMessageScrollCue(){
-  _newMessageCueVisible=true;
-  _syncScrollToBottomCue(true,{newMessage:true});
-}
-function _clearNewMessageScrollCue(){
-  _newMessageCueVisible=false;
-  _syncScrollToBottomCue(false,{newMessage:false});
-}
-function _maybeShowNewMessageScrollCue(scrollSnapshot){
-  const el=document.getElementById('messages');
-  if(!el||!scrollSnapshot) return;
-  const previousHeight=Number(scrollSnapshot.scrollHeight)||0;
-  const distance=el.scrollHeight-el.scrollTop-el.clientHeight;
-  if(el.scrollHeight>previousHeight+24 && distance>80) _showNewMessageScrollCue();
-  else _syncScrollToBottomCue(distance>80,{newMessage:_newMessageCueVisible});
-}
 if(typeof document!=='undefined'){
   document.addEventListener('wheel',_recordNonMessageScrollIntent,{capture:true,passive:true});
   document.addEventListener('touchmove',_recordNonMessageScrollIntent,{capture:true,passive:true});
-  document.addEventListener('touchstart',function(e){
-    if(e.touches&&e.touches[0]) _touchStartY=e.touches[0].clientY;
-  },{capture:true,passive:true});
-  document.addEventListener('touchend',function(){ _touchStartY=null; },{capture:true,passive:true});
-  document.addEventListener('touchcancel',function(){ _touchStartY=null; },{capture:true,passive:true});
 }
 // Reset hook for session-switch — called from sessions.js loadSession() to
 // prevent the new chat's first scroll comparing against the previous chat's
 // scrollTop (Opus stage-302 SHOULD-FIX, #1731 follow-up).
-function _resetScrollDirectionTracker(){
-  _clearNewMessageScrollCue();
-  _lastScrollTop=null;
-  _messageUserUnpinned=false;
-  _scrollPinned=true;
-  _nearBottomCount=0;
-  _touchStartY=null;
-}
-function _resetStreamScrollFollow(){
-  _clearNewMessageScrollCue();
-  _messageUserUnpinned=false;
-  _scrollPinned=true;
-  _nearBottomCount=0;
-  _lastScrollTop=null;
-  _cancelBottomSettle();
-}
-if(typeof window!=='undefined'){
-  window._resetScrollDirectionTracker=_resetScrollDirectionTracker;
-  window._resetStreamScrollFollow=_resetStreamScrollFollow;
-}
+function _resetScrollDirectionTracker(){ _lastScrollTop=null; }
+if(typeof window!=='undefined') window._resetScrollDirectionTracker=_resetScrollDirectionTracker;
 /* ── Pull-to-refresh for PWA standalone (Android) ── */
 (function(){
   if(typeof document==='undefined') return;
@@ -2609,35 +2121,20 @@ if(typeof window!=='undefined'){
     _scrollRaf=requestAnimationFrame(()=>{
       const top=el.scrollTop;
       const nearBottom=el.scrollHeight-top-el.clientHeight<250;
-      const movedUp=_lastScrollTop!==null&&top<_lastScrollTop-2;
-      const movedDown=_lastScrollTop!==null&&top>_lastScrollTop+2;
+      // scrollToBottomBtn visibility is updated below after pin state settles.
+      const movedUp=_lastScrollTop!==null && top<_lastScrollTop-2 && _recentMessageUpwardIntent();
       _lastScrollTop=top;
-      if(movedUp){
-        _cancelBottomSettle();
-        _nearBottomCount=0;
-        _scrollPinned=false;
-        _messageUserUnpinned=true;
-      }else if(movedDown&&nearBottom){
-        _nearBottomCount=_nearBottomCount+1;
-        if(_nearBottomCount>=2){
-          _scrollPinned=true;
-          _messageUserUnpinned=false;
-        }
-      }else if(!_messageUserUnpinned){
+      if(movedUp){ _cancelBottomSettle(); _nearBottomCount=0; _scrollPinned=false; _messageUserUnpinned=true; } // #1731
+      else {
         if(nearBottom){
           _nearBottomCount=_nearBottomCount+1;
           if(_nearBottomCount>=2) _scrollPinned=true;
-        }else{
-          _nearBottomCount=0;
-          _scrollPinned=false;
-        }
-      }else if(!nearBottom){
-        _nearBottomCount=0;
-        _scrollPinned=false;
-      }
-      if(nearBottom) _clearNewMessageScrollCue();
+        } else { _nearBottomCount=0; _scrollPinned=false; }
+        if(_scrollPinned) _messageUserUnpinned=false;
+      } // #1360
+      const btn=$('scrollToBottomBtn');
       const showBottomButton=!_scrollPinned && el.scrollHeight-top-el.clientHeight>80;
-      _syncScrollToBottomCue(showBottomButton,{newMessage:_newMessageCueVisible});
+      if(btn) btn.style.display=showBottomButton?'flex':'none';
       if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
       // Prefetch older messages before the reader hits the hard top. Prepending
       // then preserving scrollTop is seamless only if there is runway left for
@@ -2689,7 +2186,16 @@ function _compressionLiveCardState(){
 }
 function _updateCompressionElapsedCards(state){
   if(!state)return false;
-  return false;
+  const preview=_autoCompressionPreviewText(state), detail=_autoCompressionDetailText(state);
+  let updated=false;
+  document.querySelectorAll('.tool-card-compress-auto.tool-card-compress-running').forEach(card=>{
+    const previewEl=card.querySelector('.tool-card-preview');
+    const detailEl=card.querySelector('.tool-card-result pre');
+    if(previewEl) previewEl.textContent=preview;
+    if(detailEl) detailEl.textContent=detail;
+    updated=true;
+  });
+  return updated;
 }
 function _updateCompressionElapsedTimer(){
   const state=_compressionStateForCurrentSession()||_compressionLiveCardState();
@@ -2702,10 +2208,6 @@ function _startCompressionElapsedTimer(){if(!_compressionElapsedTimer)_compressi
 function _clearCompressionElapsedTimer(){if(_compressionElapsedTimer){clearInterval(_compressionElapsedTimer);_compressionElapsedTimer=null;}}
 let _activityElapsedTimer=null;
 let _activityElapsedTimerGroup=null;
-function _activityNowSeconds(){return Date.now()/1000;}
-function _isActivityTimerGroup(group){
-  return !!(group&&group.getAttribute('data-run-activity-group')==='1');
-}
 function _activityElapsedStartedAt(group){
   if(!group)return null;
   const raw=(group.dataset&&group.dataset.turnStartedAt!==undefined&&group.dataset.turnStartedAt!=='')
@@ -2717,52 +2219,7 @@ function _activityElapsedStartedAt(group){
 function _activityElapsedLabel(group){
   const started=_activityElapsedStartedAt(group);
   if(!started)return'';
-  return _formatActiveElapsedTimer(_activityNowSeconds()-started);
-}
-function _activityMarkObserved(group, ts){
-  if(!group||group.getAttribute('data-live-tool-call-group')!=='1')return;
-  const stamp=Number(ts||_activityNowSeconds());
-  if(Number.isFinite(stamp)&&stamp>0) group.setAttribute('data-last-activity-at',String(stamp));
-}
-function _activityLastObservedAge(group){
-  const stamp=Number(group&&group.getAttribute('data-last-activity-at'));
-  if(!Number.isFinite(stamp)||stamp<=0)return null;
-  return Math.max(0,_activityNowSeconds()-stamp);
-}
-function _activityClockLabel(ts){
-  const stamp=Number(ts||_activityNowSeconds());
-  if(!Number.isFinite(stamp)||stamp<=0)return'';
-  try{return new Date(stamp*1000).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});}catch(_){return'';}
-}
-function _activityStatusNode({kind='info',label='',detail='',status='done',ts=null,id=''}){
-  const row=document.createElement('div');
-  row.className=`agent-activity-status agent-activity-status-${kind} agent-activity-status-${status}`;
-  if(id) row.setAttribute('data-activity-event-id',id);
-  if(ts) row.setAttribute('data-activity-at',String(ts));
-  const iconMap={run:li('play',13),model:li('bot',13),waiting:'<span class="tool-card-running-dot"></span>',thinking:li('lightbulb',13),tool:li('wrench',13),done:li('check',13),warning:li('alert-triangle',13)};
-  row.innerHTML=`<span class="agent-activity-status-icon">${iconMap[kind]||li('clock',13)}</span><span class="agent-activity-status-copy"><span class="agent-activity-status-label">${esc(label)}</span>${detail?`<span class="agent-activity-status-detail">${esc(detail)}</span>`:''}</span><span class="agent-activity-status-time">${esc(_activityClockLabel(ts))}</span>`;
-  return row;
-}
-function _appendActivityEvent(group, event){
-  if(!group)return null;
-  const body=group.querySelector('.tool-call-group-body');
-  if(!body)return null;
-  const eventId=event&&event.id;
-  let row=eventId?body.querySelector(`.agent-activity-status[data-activity-event-id="${CSS.escape(eventId)}"]`):null;
-  const next=_activityStatusNode(event||{});
-  if(row){row.replaceWith(next);row=next;}
-  else{body.appendChild(next);row=next;}
-  _activityMarkObserved(group,event&&event.ts);
-  return row;
-}
-function _ensureLiveActivityBaseline(group){
-  if(!group||group.getAttribute('data-live-tool-call-group')!=='1')return;
-  const started=_activityElapsedStartedAt(group)||_activityNowSeconds();
-  if(!group.getAttribute('data-turn-started-at')) group.setAttribute('data-turn-started-at',String(started));
-  if(!group.getAttribute('data-last-activity-at')) group.setAttribute('data-last-activity-at',String(started));
-  _appendActivityEvent(group,{id:'run-started',kind:'run',label:'Run started',detail:'Observable activity will appear here as the agent works.',status:'done',ts:started});
-  const modelLabel=(S.session&&S.session.model)?getModelLabel(S.session.model):'';
-  if(modelLabel)_appendActivityEvent(group,{id:'run-model',kind:'model',label:`Model: ${modelLabel}`,detail:S.activeProfile&&S.activeProfile!=='default'?`Profile: ${S.activeProfile}`:'',status:'done',ts:started});
+  return _formatActiveElapsedTimer((Date.now()/1000)-started);
 }
 function _setActivityElapsedStartedAt(group){
   if(!group||group.getAttribute('data-live-tool-call-group')!=='1')return;
@@ -2771,7 +2228,7 @@ function _setActivityElapsedStartedAt(group){
 }
 function _updateActiveActivityElapsedTimer(){
   const group=_activityElapsedTimerGroup;
-  if(!group||!group.isConnected||group.getAttribute('data-live-tool-call-group')!=='1'||group.getAttribute('data-live-activity-current')!=='1'){
+  if(!group||!group.isConnected||group.getAttribute('data-live-tool-call-group')!=='1'){
     _clearActivityElapsedTimer();
     return;
   }
@@ -2783,10 +2240,8 @@ function _updateActiveActivityElapsedTimer(){
     group.removeAttribute('data-active-turn-elapsed');
   }
   if(durationEl){
-    const activeText=label?`Working for ${label}`:'';
-    const progressText=_activityLiveProgressLabel(group);
-    durationEl.textContent=[progressText, activeText].filter(Boolean).join(' · ');
-    durationEl.style.display=durationEl.textContent?'':'none';
+    durationEl.textContent=label?`Working ${label}`:'';
+    durationEl.style.display=label?'':'none';
   }
 }
 function _startActivityElapsedTimer(group){
@@ -2830,6 +2285,7 @@ function _setCtxCompressButton(btn,text){
 }
 
 function _syncMobileCtxDisplay(state){
+  const badge=$('composerMobileCtxBadge');
   const mobileConfigBtn=$('composerMobileConfigBtn');
   const row=$('composerMobileContextAction');
   const usageLine=$('composerMobileContextUsage');
@@ -2838,34 +2294,22 @@ function _syncMobileCtxDisplay(state){
   const costLine=$('composerMobileContextCost');
   const compressBtn=$('composerMobileCtxCompressBtn');
   if(!state||!state.visible){
+    if(badge)badge.style.display='none';
     if(row)row.style.display='none';
     if(mobileConfigBtn){
       mobileConfigBtn.setAttribute('aria-label',_MOBILE_CONFIG_BASE_LABEL);
       mobileConfigBtn.setAttribute('title',_MOBILE_CONFIG_BASE_LABEL);
     }
     _setCtxCompressButton(compressBtn,'');
-    // Reset context ring to 0% to clear any stale values from previous sessions
-    var arc = document.getElementById('ctx-arc');
-    var num = document.getElementById('ctx-num');
-    if (arc && num) {
-      var circumference = 87.96;
-      arc.setAttribute('stroke-dashoffset', circumference);
-      num.textContent = '0';
-      arc.setAttribute('stroke', '#22c55e');
-    }
     return;
   }
-  (function updateCtxRing(pct) {
-    var arc = document.getElementById('ctx-arc');
-    var num = document.getElementById('ctx-num');
-    if (!arc || !num) return;
-    var offset = 87.96 * (1 - Math.min(pct, 100) / 100);
-    arc.setAttribute('stroke-dashoffset', offset);
-    num.textContent = Math.round(pct);
-    arc.setAttribute('stroke',
-      pct <= 50 ? '#22c55e' : pct <= 85 ? '#f97316' : '#ef4444'
-    );
-  })(state.pct);
+  if(badge){
+    badge.style.display='inline-flex';
+    badge.textContent=state.hasPromptTok?String(state.pct):'\u00b7';
+    badge.classList.toggle('ctx-mid',state.pct>50&&state.pct<=75);
+    badge.classList.toggle('ctx-high',state.pct>75);
+    badge.setAttribute('title',state.label);
+  }
   if(mobileConfigBtn){
     mobileConfigBtn.setAttribute('aria-label',`${_MOBILE_CONFIG_BASE_LABEL}; ${state.label}`);
     mobileConfigBtn.setAttribute('title',`${_MOBILE_CONFIG_BASE_LABEL} \u00b7 ${state.label}`);
@@ -2897,30 +2341,6 @@ function _syncMobileCtxDisplay(state){
     }
   }
   _setCtxCompressButton(compressBtn,state.compressText||'');
-}
-
-function _mergeUsageForCtxIndicator(latest, fallback){
-  const latestObj=(latest&&typeof latest==='object')?latest:{};
-  const fallbackObj=(fallback&&typeof fallback==='object')?fallback:{};
-  const merged={...latestObj};
-  for(const field of [
-    'input_tokens','output_tokens','estimated_cost',
-    'cache_read_tokens','cache_write_tokens','cache_hit_percent',
-    'turn_cache_hit_percent','duration_seconds','tps','gateway_routing',
-  ]){
-    if(merged[field]==null&&fallbackObj[field]!=null){
-      merged[field]=fallbackObj[field];
-    }
-  }
-  if(!(Number(latestObj.context_length)>0)&&Number(fallbackObj.context_length)>0){
-    merged.context_length=fallbackObj.context_length;
-  }
-  for(const field of ['threshold_tokens','last_prompt_tokens']){
-    if(latestObj[field]==null&&fallbackObj[field]!=null){
-      merged[field]=fallbackObj[field];
-    }
-  }
-  return merged;
 }
 
 // Context usage indicator in composer footer
@@ -3060,47 +2480,15 @@ function _setMessageScrollToBottom(){
   _lastScrollTop=el.scrollTop;
   _nearBottomCount=2;
   _scrollPinned=true;
-  requestAnimationFrame(()=>{
-    // Retry the bottom write on the next layout frame so a DOM rebuild that
-    // grows the transcript after the first write doesn't strand a pinned
-    // conversation mid-scroll (#3319). But by this frame the user may have
-    // scrolled up — under the sticky-unpin model (#3343) _messageUserUnpinned
-    // is the authoritative "user scrolled away" signal, so DON'T snap them back
-    // or re-pin if so; only release the programmatic-scroll latch.
-    if(_messageUserUnpinned || !_scrollPinned || _recentNonMessageScrollIntent()){
-      requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
-      return;
-    }
-    el.scrollTop=el.scrollHeight;
-    _lastScrollTop=el.scrollTop;
-    _nearBottomCount=2;
-    _scrollPinned=true;
-    requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
-  });
+  requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
 }
 function _isMessagePaneNearBottom(threshold=250){
   const el=$('messages');
   if(!el) return false;
   return el.scrollHeight-el.scrollTop-el.clientHeight<=threshold;
 }
-function _messageBottomDistance(){
-  const el=$('messages');
-  if(!el) return 0;
-  return el.scrollHeight-el.scrollTop-el.clientHeight;
-}
 function _shouldFollowMessagesOnDomReplace(){
-  // Final stream settlement replaces the live DOM with persisted messages. Keep
-  // following only for users who are still pinned or effectively at the tail.
-  // A broad near-bottom window causes long answers/mobile readers who scroll up
-  // a little to read mid-stream to get snapped back to the bottom on completion.
-  return !_messageUserUnpinned && (_scrollPinned || _isMessagePaneNearBottom(120));
-}
-function _followMessagesAfterDomReplace(){
-  if(_shouldFollowMessagesOnDomReplace()){
-    scrollToBottom();
-    return true;
-  }
-  return false;
+  return !_messageUserUnpinned && (_scrollPinned || _isMessagePaneNearBottom(1200));
 }
 function _settleMessageScrollToBottom(force){
   // Markdown post-processing (Prism, tables, Mermaid/KaTeX/PDF placeholders)
@@ -3112,27 +2500,24 @@ function _settleMessageScrollToBottom(force){
   const passes=[0,16,80,180];
   passes.forEach(delay=>setTimeout(()=>{
     if(token!==_bottomSettleToken) return;
-    if(!force && (!_scrollPinned||_messageUserUnpinned||_recentNonMessageScrollIntent())) return;
+    if(!force && (!_scrollPinned||_recentNonMessageScrollIntent())) return;
     _setMessageScrollToBottom();
   },delay));
   requestAnimationFrame(()=>{
     if(token!==_bottomSettleToken) return;
-    if(force || (_scrollPinned&&!_messageUserUnpinned&&!_recentNonMessageScrollIntent())) _setMessageScrollToBottom();
+    if(force || (_scrollPinned&&!_recentNonMessageScrollIntent())) _setMessageScrollToBottom();
     requestAnimationFrame(()=>{
       if(token!==_bottomSettleToken) return;
-      if(force || (_scrollPinned&&!_messageUserUnpinned&&!_recentNonMessageScrollIntent())) _setMessageScrollToBottom();
+      if(force || (_scrollPinned&&!_recentNonMessageScrollIntent())) _setMessageScrollToBottom();
     });
   });
 }
 function scrollIfPinned(){
-  if(_messageUserUnpinned) return;
   if(!_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
-  if(_messageBottomDistance()>500) _setMessageScrollToBottom();
   _settleMessageScrollToBottom(false);
 }
 function scrollToBottom(){
-  _clearNewMessageScrollCue();
   _scrollPinned=true;
   _messageUserUnpinned=false;
   // Write the first bottom position synchronously. A final renderMessages()
@@ -3141,7 +2526,8 @@ function scrollToBottom(){
   // them before the viewport ever reaches the bottom.
   _setMessageScrollToBottom();
   _settleMessageScrollToBottom(true);
-  _syncScrollToBottomCue(false,{newMessage:false});
+  const btn=$('scrollToBottomBtn');
+  if(btn) btn.style.display='none';
   if(typeof _updateSessionStartJumpButton==='function') _updateSessionStartJumpButton();
 }
 
@@ -3172,7 +2558,7 @@ function getModelLabel(modelId){
   if(rawId.startsWith('@custom:')){
     const rest=rawId.slice('@custom:'.length);
     if(rest.includes(':')) return rest.slice(rest.lastIndexOf(':')+1)||rawId;
-    if(rest.includes('/')) return rest.slice(rest.indexOf('/')+1)||rawId;
+    if(rest.includes('/')) return rest.split('/').pop()||rawId;
     return rest||rawId;
   }
   // Check dynamic labels first, then fall back to splitting the ID
@@ -3180,47 +2566,8 @@ function getModelLabel(modelId){
   // Static fallback for common models
   const STATIC_LABELS={'openai/gpt-5.4-mini':'GPT-5.4 Mini','openai/gpt-4o':'GPT-4o','openai/o3':'o3','openai/o4-mini':'o4-mini','anthropic/claude-sonnet-4.6':'Sonnet 4.6','anthropic/claude-sonnet-4-5':'Sonnet 4.5','anthropic/claude-haiku-3-5':'Haiku 3.5','google/gemini-3.1-pro-preview':'Gemini 3.1 Pro','google/gemini-3-flash-preview':'Gemini 3 Flash','google/gemini-3.1-flash-lite-preview':'Gemini 3.1 Flash Lite','google/gemini-2.5-pro':'Gemini 2.5 Pro','google/gemini-2.5-flash':'Gemini 2.5 Flash','deepseek/deepseek-v4-flash':'DeepSeek V4 Flash','deepseek/deepseek-v4-pro':'DeepSeek V4 Pro','deepseek/deepseek-chat-v3-0324':'DeepSeek V3 (legacy)','meta-llama/llama-4-scout':'Llama 4 Scout'};
   if(STATIC_LABELS[modelId]) return STATIC_LABELS[modelId];
-  // Safe Ollama-tag fallback: strip only the first slash-segment (provider
-  // prefix) so multi-slash IDs preserve their vendor hierarchy (#3360).
-  // URI-scheme ids (e.g. `gpt://${FOLDER}/deepseek-v4-flash/latest`, provider
-  // `yandex:gpt`) must NOT be first-segment-stripped — `indexOf('/')` would
-  // land inside the `://` and leave `/${FOLDER}/...` path junk (#3429). For a
-  // `scheme://authority/path...` id, drop the scheme AND the authority, then
-  // pick the model name from the PATH segments only. A version/channel tail
-  // (`latest`/`stable`/numeric) is skipped only when a real model segment
-  // precedes it — never promoting the authority or a container folder (#3429).
-  let _last;
-  const _uriMatch = /^[a-z][a-z0-9+.-]*:\/\/(.+)$/i.exec(modelId);
-  if (_uriMatch) {
-    const _all = _uriMatch[1].split('/').filter(Boolean);
-    // _all[0] is the authority (folder/host); the model lives in the path tail.
-    const _path = _all.slice(1);
-    // A pure version/channel tail: named channels, or a bare version number
-    // (`v4`, `1.2`, `20231231`) — NOT a mixed model name that merely starts
-    // with a digit (`2026-model`, `4o-mini`), which must be kept as the label.
-    const _isVersionTail = (s) => /^(latest|stable|current|default|v\d[\d.]*|\d[\d.]*)$/i.test(s);
-    const _isPlaceholder = (s) => /\$\{[^}]*\}/.test(s);
-    // Walk path segments right-to-left; the model name is the LAST segment that
-    // is neither a version/channel tail (`latest`, `v4`, `1.2`) nor a `${...}`
-    // env-var placeholder. Fall back to the last non-placeholder segment, then
-    // the literal last segment. Never returns the authority (`_all[0]`).
-    let _pick = '';
-    let _lastUsable = '';
-    for (let _i = _path.length - 1; _i >= 0; _i--) {
-      const _seg = _path[_i];
-      if (_isPlaceholder(_seg)) continue;
-      if (!_lastUsable) _lastUsable = _seg;
-      if (!_isVersionTail(_seg)) { _pick = _seg; break; }
-    }
-    // Fallbacks: the chosen non-version segment, else the last non-placeholder
-    // path segment. NEVER the authority and NEVER a `${...}` placeholder — for
-    // a degenerate id (`gpt://folder123`, `gpt://folder123/${MODEL}`) fall all
-    // the way back to the raw id rather than leak the folder/host or env var.
-    const _lastPath = _path[_path.length - 1] || '';
-    _last = _pick || _lastUsable || (_lastPath && !_isPlaceholder(_lastPath) ? _lastPath : '') || modelId;
-  } else {
-    _last = modelId.includes('/') ? (modelId.slice(modelId.indexOf('/')+1) || modelId) : modelId;
-  }
+  // Safe Ollama-tag fallback formatter before generic split('/').pop()
+  let _last = modelId.split('/').pop() || modelId;
   // Strip @provider: prefix if present (e.g. @ollama-cloud:kimi-k2.6)
   if (_last.startsWith('@') && _last.includes(':')) _last = _last.split(':').slice(1).join(':');
   const looksLikeOllamaTag = /^[a-z0-9][\w.-]*:[\w.-]+$/i.test(_last);
@@ -3303,19 +2650,14 @@ function _sanitizeThinkingDisplayText(text){
   return stripped.trim();
 }
 
-function _normalizeThinkingEchoCompare(text){
-  return String(text||'').replace(/\s+/g,' ').trim();
-}
-
-function _stripVisibleAssistantEchoFromThinking(thinkingText, ...visibleTexts){
-  const clean=_sanitizeThinkingDisplayText(thinkingText);
-  const thinkingNorm=_normalizeThinkingEchoCompare(clean);
-  if(!thinkingNorm) return '';
-  for(const visibleText of visibleTexts){
-    const visibleNorm=_normalizeThinkingEchoCompare(visibleText);
-    if(visibleNorm&&visibleNorm===thinkingNorm) return '';
-  }
-  return clean;
+function _stripVisibleAssistantEchoFromThinking(thinkingText, visibleText){
+  let out=String(thinkingText||'');
+  const visible=String(visibleText||'');
+  if(!out||!visible) return out.trim();
+  visible.split(/\n{2,}/).map(s=>s.trim()).filter(s=>s.length>=20).forEach(snippet=>{
+    out=out.split(snippet).join('');
+  });
+  return out.trim();
 }
 
 function renderMd(raw){
@@ -3478,10 +2820,9 @@ function renderMd(raw){
   s=s.replace(/\$\$([\s\S]+?)\$\$/g,(_,m)=>{math_stash.push({type:'display',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
   // Match a single literal backslash before the display delimiter (the common LLM form).
   s=s.replace(/\\\[([\s\S]+?)\\\]/g,(_,m)=>{math_stash.push({type:'display',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
-  // Inline math: $...$ — require non-space/non-digit at opening boundary to avoid
-  // false positives on currency like "$1,000 xuống ~$95" or "costs $5 and $10".
-  // Aligns with smd's se() guard which also rejects $ followed by digits.
-  s=s.replace(/\$([^\s$\d\n][^$\n]*?[^\s$\n]|[^\s\d])\$/g,(_,m)=>{if(m.includes(' | '))return '\$'+m+'\$';math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
+  // Inline math: $...$ — require non-space at boundaries to avoid false positives
+  // e.g. "costs $5 and $10" should not trigger (space after opening $)
+  s=s.replace(/\$([^\s$\n][^$\n]*?[^\s$\n]|\S)\$/g,(_,m)=>{if(m.includes(' | '))return '\$'+m+'\$';math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
   // Also stash \(...\) LaTeX delimiters.
   // Match a single literal backslash before the delimiter (the common LLM form).
   s=s.replace(/\\\((.+?)\\\)/g,(_,m)=>{math_stash.push({type:'inline',src:m});return '\x00M'+(math_stash.length-1)+'\x00';});
@@ -3491,17 +2832,6 @@ function renderMd(raw){
   // backticks for multiline code and break subsequent code-box rendering.
   const rawPreStash=[];
   s=s.replace(/(<pre\b[^>]*>[\s\S]*?<\/pre>)/gi,m=>{rawPreStash.push(m);return `\x00R${rawPreStash.length-1}\x00`;});
-  // Bare file:// artifact links → media. Some gateway/tool surfaces emit bare
-  // file:// links for local artifacts instead of MEDIA: tokens; browser clients
-  // cannot open the server filesystem directly, so route them through /api/media.
-  // Runs AFTER fenced-block (\x00P), inline-code (\x00F), AND raw-<pre> (\x00R)
-  // stashing so a file:// inside any code/preformatted region stays literal text
-  // (#3219/#3234). Only bare URLs (line-start or whitespace-delimited) match, so
-  // normal [label](file://...) markdown anchors keep the link path below.
-  s=s.replace(/(^|\s)(file:\/\/[^\s<>"')\]]+)/g,(_,lead,raw_ref)=>{
-    media_stash.push(raw_ref);
-    return lead+'\x00D'+(media_stash.length-1)+'\x00';
-  });
   s=s.replace(/<strong>([\s\S]*?)<\/strong>/gi,(_,t)=>'**'+t+'**');
   s=s.replace(/<b>([\s\S]*?)<\/b>/gi,(_,t)=>'**'+t+'**');
   s=s.replace(/<em>([\s\S]*?)<\/em>/gi,(_,t)=>'*'+t+'*');
@@ -3559,7 +2889,7 @@ function renderMd(raw){
     t=t.replace(/\x00C(\d+)\x00/g,(_,i)=>_code_stash[+i]);
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
-    t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
+    t=t.replace(/\[([^\]]+)\]\(((?:https?|file):\/\/[^\)]+)\)/g,(_,lb,u)=>{_link_stash.push(`<a href="${_markdownHref(u)}" target="_blank" rel="noopener">${esc(lb)}</a>`);return `\x00L${_link_stash.length-1}\x00`;});
     t=t.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
@@ -3582,86 +2912,38 @@ function renderMd(raw){
   s=s.replace(/^---+$/gm,'<hr>');
   // (Blockquotes are handled by the pre-pass at the top of renderMd, before
   // fence_stash. The per-line passes below never see > prefixes.)
-  function _renderListBlock(lines, ordered){
-    const marker=ordered?'\\d+\\. ':'[-*+] ';
-    let html=ordered?'<ol>':'<ul>';
-    let item=null;
-    const flush=()=>{
-      if(!item) return;
-      const body=item.parts.join('\n').trim();
-      const text=body;
-      let inner;
-      if(!ordered && /^\[x\] /i.test(text)) inner='<span class="task-done">✅</span> '+inlineMd(text.slice(4));
-      else if(!ordered && /^\[ \] /.test(text)) inner='<span class="task-todo">☐</span> '+inlineMd(text.slice(4));
-      else inner=inlineMd(text);
-      const valueAttr=item.value!==null?` value="${item.value}"`:'';
-      const styleAttr=item.indent?` style="margin-left:16px"`:'';
-      html+=`<li${valueAttr}${styleAttr}>${inner}</li>`;
-      item=null;
-    };
-    for(const raw of lines){
-      const line=String(raw||'');
-      const nested=line.match(new RegExp(`^ {2,}(${marker})(.*)$`));
-      if(nested){
-        flush();
-        item={indent:true,value:ordered?parseInt(nested[1],10):null,parts:[nested[2]]};
-        continue;
-      }
-      const top=line.match(new RegExp(`^(?:  )?(${marker})(.*)$`));
-      if(top){
-        flush();
-        item={indent:false,value:ordered?parseInt(top[1],10):null,parts:[top[2]]};
-        continue;
-      }
-      if(!item) continue;
-      item.parts.push(line.replace(/^ {2,}/,'').trim());
+  // B8: improved list handling supporting up to 2 levels of indentation
+  s=s.replace(/((?:^(?:  )?[-*+] .+\n?)+)/gm,block=>{
+    const lines=block.trimEnd().split('\n');
+    let html='<ul>';
+    for(const l of lines){
+      const indent=/^ {2,}/.test(l);
+      const text=l.replace(/^ {0,4}[-*+] /,'');
+      let _ih;
+      if(/^\[x\] /i.test(text)) _ih='<span class="task-done">✅</span> '+inlineMd(text.slice(4));
+      else if(/^\[ \] /.test(text)) _ih='<span class="task-todo">☐</span> '+inlineMd(text.slice(4));
+      else _ih=inlineMd(text);
+      if(indent) html+=`<li style="margin-left:16px">${_ih}</li>`;
+      else html+=`<li>${_ih}</li>`;
     }
-    flush();
-    return html+(ordered?'</ol>':'</ul>');
-  }
-  function _renderLists(src, ordered){
-    const lines=src.split('\n');
-    const out=[];
-    const topRe=ordered?/^(?:  )?\d+\. /:/^(?:  )?[-*+] /;
-    const nestedRe=ordered?/^ {2,}\d+\. /:/^ {2,}[-*+] /;
-    const contRe=/^ {2,}\S/;
-    let i=0;
-    while(i<lines.length){
-      if(!topRe.test(lines[i])){
-        out.push(lines[i]);
-        i++;
-        continue;
-      }
-      const block=[lines[i]];
-      i++;
-      while(i<lines.length){
-        const line=lines[i];
-        if(topRe.test(line)||nestedRe.test(line)||contRe.test(line)){
-          block.push(line);
-          i++;
-          continue;
-        }
-        if(!line.trim()){
-          const next=lines[i+1]||'';
-          if(topRe.test(next)||nestedRe.test(next)||contRe.test(next)){
-            i++;
-            continue;
-          }
-        }
-        break;
-      }
-      out.push(_renderListBlock(block,ordered));
+    return html+'</ul>';
+  });
+  // Ordered lists: use value= on each <li> so the correct number is preserved
+  // even when blank lines between items cause the paragraph splitter to place
+  // each item in its own <ol> container — without value= every <ol> restarts
+  // at 1, producing "1. 1. 1." instead of "1. 2. 3." (#886).
+  s=s.replace(/((?:^(?:  )?\d+\. .+\n?)+)/gm,block=>{
+    const lines=block.trimEnd().split('\n');
+    let html='<ol>';
+    for(const l of lines){
+      const numMatch=l.match(/^\s*(\d+)\. /);
+      const num=numMatch?parseInt(numMatch[1],10):null;
+      const text=l.replace(/^ {0,4}\d+\. /,'');
+      const valAttr=num!==null?` value="${num}"`:'';
+      html+=`<li${valAttr}>${inlineMd(text)}</li>`;
     }
-    return out.join('\n');
-  }
-  // Preserve continuation lines, nested indentation, and LaTeX placeholder lines
-  // inside list items without changing the wider markdown pipeline.
-  s=_renderLists(s,false);
-  // Ordered-list parsing intentionally runs on the post-unordered string; the
-  // unordered pass emits <ul> HTML that cannot satisfy the ordered-item regex.
-  // Keep continuation lines attached to their item and preserve explicit
-  // numbering via value= even when blank lines split the markdown.
-  s=_renderLists(s,true);
+    return html+'</ol>';
+  });
   // Tables: | col | col | header row followed by | --- | --- | separator then data rows
   // NOTE: table pass runs BEFORE outer link pass so [label](url) in table cells
   // is handled by inlineMd() only — prevents double-linking.
@@ -3700,7 +2982,7 @@ function renderMd(raw){
   // Stash existing <a> tags first to avoid re-linking already-linked URLs.
   const _a_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>)/g,m=>{_a_stash.push(m);return `\x00A${_a_stash.length-1}\x00`;});
-  s=s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:)[^\s\)]+)\)/g,(_,label,url)=>_markdownAnchor(label,url));
+  s=s.replace(/\[([^\]]+)\]\(((?:https?|file):\/\/[^\)]+)\)/g,(_,label,url)=>`<a href="${_markdownHref(url)}" target="_blank" rel="noopener">${esc(label)}</a>`);
   s=s.replace(/\x00A(\d+)\x00/g,(_,i)=>_a_stash[+i]);
   // Restore raw <pre> only after markdown rewrites so literal preformatted
   // content stays placeholder-protected, then let the sanitizer normalize tags.
@@ -3718,24 +3000,6 @@ function renderMd(raw){
   }
   function _markdownHref(raw){
     const href=String(raw||'').replace(/"/g,'%22');
-    if(/^session:\/\//i.test(href)){
-      const sid=href.replace(/^session:\/\//i,'').split(/[?#]/)[0];
-      try{
-        const decoded=decodeURIComponent(sid);
-        if(typeof _sessionUrlForSid==='function') return _sessionUrlForSid(decoded);
-        return 'session/'+encodeURIComponent(decoded);
-      }catch(_){
-        return 'session/'+encodeURIComponent(sid);
-      }
-    }
-    if(/^workspace:\/\//i.test(href)){
-      try{
-        const rel=decodeURIComponent(href.replace(/^workspace:\/\//i,'')).replace(/^~\//,'').replace(/^\.\//,'');
-        return '#workspace='+encodeURIComponent(rel);
-      }catch(_){
-        return '#';
-      }
-    }
     if(/^file:\/\//i.test(href)){
       try{
         const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
@@ -3746,37 +3010,14 @@ function renderMd(raw){
     }
     return href;
   }
-  function _isInternalSessionHref(raw){
-    const href=String(raw||'').trim();
-    if(/^session\/[^?#]+/i.test(href)) return true;
-    try{
-      const base=(typeof document!=='undefined'&&document.baseURI)||
-        (typeof window!=='undefined'&&window.location&&window.location.href)||
-        'http://localhost/';
-      const url=new URL(href,base);
-      const baseUrl=new URL(base,base);
-      if(url.origin!==baseUrl.origin) return false;
-      const basePath=baseUrl.pathname.replace(/(?:index\.html)?$/,'').replace(/\/[^/]*$/,'/');
-      const root=basePath.endsWith('/')?basePath:basePath+'/';
-      return url.pathname.startsWith(root+'session/')||url.pathname.startsWith('/session/');
-    }catch(_){
-      return false;
-    }
-  }
-  function _markdownAnchor(label,rawUrl){
-    const href=_markdownHref(rawUrl);
-    const internal=/^session:\/\//i.test(String(rawUrl||'')) || _isInternalSessionHref(href);
-    return `<a${internal?' class="session-link"':''} href="${href}"${internal?'':' target="_blank" rel="noopener"'}>${esc(label)}</a>`;
-  }
   function _isSafeUrl(v, img){
     const raw=_safeAttrValue(v);
     const compact=raw.replace(/[\u0000-\u001f\u007f\s]+/g,'').toLowerCase();
     if(!compact) return false;
     if(/^(javascript|data|vbscript):/i.test(compact)) return false;
     if(/^https?:\/\//i.test(raw)) return true;
-    if(/^(mailto:|tel:)/i.test(raw)) return true;
     if(img && /^api\//i.test(raw)) return true;
-    if(!img && (/^api\//i.test(raw) || /^#/.test(raw) || _isInternalSessionHref(raw))) return true;
+    if(!img && (/^api\//i.test(raw) || /^#/.test(raw))) return true;
     return false;
   }
   function _attrs(raw){
@@ -3824,7 +3065,7 @@ function renderMd(raw){
       if(!_isSafeUrl(a.href,false)) return '<a>';
       const target=a.target==='_blank'?' target="_blank"':'';
       const rel=a.rel==='noopener'?' rel="noopener"':'';
-      const cls=_cls(a.class,['msg-media-link','skill-linked-file','skill-file-back','session-link']);
+      const cls=_cls(a.class,['msg-media-link','skill-linked-file','skill-file-back']);
       const download=a.download?` download="${esc(a.download)}"`:'';
       return `<a${cls} href="${esc(_safeAttrValue(a.href))}"${target}${rel}${download}>`;
     }
@@ -3889,7 +3130,7 @@ function renderMd(raw){
   s=s.replace(/\x00E(\d+)\x00/g,(_,i)=>_pre_stash[+i]);
   // ── Restore MEDIA stash → inline images or download links ─────────────────
   s=s.replace(/\x00D(\d+)\x00/g,(_,i)=>{
-    let ref=media_stash[+i];
+    const ref=media_stash[+i];
     // Keep this logic self-contained: some tests extract renderMd() alone and
     // execute it in node, without the top-level helper functions from ui.js.
     const mediaKindForName=(name='')=>{
@@ -3908,28 +3149,6 @@ function renderMd(raw){
         : `<audio class="msg-media-player msg-media-audio" src="${safeSrc}" controls preload="metadata" title="${safeName}"></audio>`;
       return `<div class="msg-media-editor msg-media-editor--${kind}" data-media-kind="${kind}">${tag}<div class="msg-media-meta"><span class="msg-media-name">${safeName}</span></div></div>`;
     };
-    const localArtifactCard=(src,name)=>{
-      const safeSrc=esc(src);
-      const safeName=esc(name||'image');
-      const tt=(typeof t==='function')?t:(key=>({media_download:'Download'}[key]||key));
-      // Clean inline image (keeps the existing .msg-media-img lightbox-on-click
-      // behavior) with a hover/focus-revealed Download action overlaid top-right,
-      // matching the ChatGPT/Claude/Gemini pattern. The image stays the hero —
-      // no permanent card chrome. Download is the one affordance the lightbox
-      // (zoom-on-click) doesn't already provide.
-      const dlLabel=esc(tt('media_download'));
-      const dlSvg='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>';
-      return `<span class="msg-artifact-image"><img class="msg-media-img" src="${safeSrc}" alt="${safeName}" loading="lazy"><a class="msg-artifact-download" href="${safeSrc}" download="${safeName}" title="${dlLabel}" aria-label="${dlLabel}" onclick="event.stopPropagation()">${dlSvg}</a></span>`;
-    };
-    if(/^file:\/\//i.test(ref)){
-      try{
-        const u=new URL(ref);
-        ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
-      }catch(_){
-        try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
-        catch(__){ref=ref.replace(/^file:\/\//i,'');}
-      }
-    }
     // HTTP(S) URL
     if(/^https?:\/\//i.test(ref)){
       // Rewrite localhost/127.0.0.1 to the actual server base URL so remote
@@ -3958,11 +3177,10 @@ function renderMd(raw){
       return `<a href="${esc(src)}" target="_blank" rel="noopener">${esc(src)}</a>`;
     }
     // Local file path
-    const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
-    const apiUrl='api/media?path='+encodeURIComponent(ref)+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'');
+    const apiUrl='api/media?path='+encodeURIComponent(ref);
     const localKind=mediaKindForName(ref);
     if(localKind==='image'){
-      return localArtifactCard(apiUrl,ref.split('/').pop()||'image');
+      return `<img class="msg-media-img" src="${esc(apiUrl)}" alt="${esc(ref.split('/').pop())}" loading="lazy">`;
     }
     // SVG → inline image (no download, render directly)
     if(_SVG_EXTS.test(ref)){
@@ -4006,10 +3224,6 @@ function renderMd(raw){
   return s;
 }
 
-function _stripAttachedFilesMarkerForDisplay(text){
-  return String(text||'').replace(/\n\n\[Attached files: [^\]]+\]$/,'').trim();
-}
-
 function setStatus(t){
   if(!t)return;
   showToast(t, 4000);
@@ -4028,7 +3242,6 @@ function setComposerStatus(t){
 }
 
 let _composerLockState=null;
-let _compressionPlaceholderSaved=null;
 
 function lockComposerForClarify(placeholderText){
   const input=$('msg');
@@ -4100,7 +3313,6 @@ function getComposerPrimaryAction(){
   if(!isBusy) return hasContent?'send':'disabled';
   if(!hasContent){
     if(S.activeStreamId&&typeof cancelStream==='function') return 'stop';
-    if(compressionRunning) return 'queue';
     return 'disabled';
   }
   const explicitAction=_getExplicitBusyCommandAction(msg&&msg.value);
@@ -4145,10 +3357,10 @@ function updateSendBtn(){
   let _btnTitle;
   if(action==='disabled'){
     const _dmsg=$('msg');
+    const _dcompr=typeof isCompressionUiRunning==='function'&&isCompressionUiRunning();
     if(_dmsg&&_dmsg.disabled) _btnTitle=_tt('composer_disabled_clarify','Respond to the clarification request');
+    else if(_dcompr) _btnTitle=_tt('composer_disabled_compression','Waiting for compression to finish');
     else _btnTitle=_tt('composer_disabled_empty','Type a message to send');
-  }else if(action==='queue'&&typeof isCompressionUiRunning==='function'&&isCompressionUiRunning()){
-    _btnTitle=_tt('composer_compression_will_queue','Type a message — it will queue and send after compression');
   }else{
     const _tmap={send:'Send message',queue:'Queue message',interrupt:'Interrupt and send',steer:'Steer current response',stop:'Stop generation'};
     _btnTitle=_tt('composer_'+action,_tmap[action]||'Send message');
@@ -4277,8 +3489,8 @@ function _renderQueueChips(sid){
 
   function _saveAndRefresh(){
     const liveQ=_getSessionQueue(sid,false);
-    if(!liveQ.length){delete SESSION_QUEUES[sid];_clearPersistedSessionQueue(sid);}
-    else{SESSION_QUEUES[sid]=[...liveQ];_persistSessionQueueStorage(sid,liveQ);}
+    if(!liveQ.length){delete SESSION_QUEUES[sid];try{sessionStorage.removeItem('hermes-queue-'+sid);}catch(_){}}
+    else{SESSION_QUEUES[sid]=[...liveQ];try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}}
     delete _queueRenderKeys[sid];
     updateQueueBadge(sid);
   }
@@ -4305,7 +3517,7 @@ function _renderQueueChips(sid){
         const firstFiles=(snapshot.find(e=>e&&Array.isArray(e.files)&&e.files.length)||{files:[]}).files;
         liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
         SESSION_QUEUES[sid]=liveQ;
-        _persistSessionQueueStorage(sid,liveQ);
+        try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}
         delete _queueRenderKeys[sid];
         updateQueueBadge(sid);
       };
@@ -4385,7 +3597,7 @@ function _renderQueueChips(sid){
         const idx=_entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===_entryTs):i;
         if(idx!==-1){
           liveQ[idx]={...liveQ[idx],text:newText};
-          _persistSessionQueueStorage(sid,liveQ);
+          try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}
           delete _queueRenderKeys[sid];
           updateQueueBadge(sid);
         }
@@ -4424,8 +3636,8 @@ function _renderQueueChips(sid){
       const liveQ=_getSessionQueue(sid,false);
       const idx=_entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===_entryTs):i;
       if(idx!==-1) liveQ.splice(idx,1);
-      if(!liveQ.length){delete SESSION_QUEUES[sid];_clearPersistedSessionQueue(sid);}
-      else{SESSION_QUEUES[sid]=[...liveQ];_persistSessionQueueStorage(sid,liveQ);}
+      if(!liveQ.length){delete SESSION_QUEUES[sid];try{sessionStorage.removeItem('hermes-queue-'+sid);}catch(_){}}
+      else{SESSION_QUEUES[sid]=[...liveQ];try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}}
       delete _queueRenderKeys[sid];
       updateQueueBadge(sid);
     };
@@ -4499,12 +3711,6 @@ const TOAST_DEFAULT_MS=2800;
 const TOAST_ERROR_DEFAULT_MS=20000;
 function clearToastDismissTimer(el){if(!el)return;clearTimeout(el._t);el._t=null;}
 function setToastDismissTimer(el,duration){if(!el)return;clearToastDismissTimer(el);el._t=setTimeout(()=>{el.classList.remove('show');},duration);}
-function dismissToast(btnOrEl){
-  const el=btnOrEl&&btnOrEl.closest?btnOrEl.closest('#toast'):(btnOrEl&&btnOrEl.id==='toast'?btnOrEl:null);
-  if(!el)return;
-  clearToastDismissTimer(el);
-  el.classList.remove('show');
-}
 function copyToastText(btn){
   const el=btn&&btn.closest?btn.closest('#toast'):null;
   const text=el?(el.dataset.toastMessage||el.textContent||''):'';
@@ -4518,13 +3724,12 @@ function showToast(msg,ms,type){
   const duration=(ms==null)?(t==='error'?TOAST_ERROR_DEFAULT_MS:TOAST_DEFAULT_MS):ms;
   el.className='toast show '+t;
   el.dataset.toastMessage=s;
-  if(t==='error') el.innerHTML=`<span class="toast-message">${esc(s)}</span><button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button><button class="toast-dismiss" type="button" aria-label="Dismiss error toast" data-toast-dismiss="1" onclick="dismissToast(this);event.stopPropagation()">Dismiss</button>`;
+  if(t==='error') el.innerHTML=`<span class="toast-message">${esc(s)}</span><button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button>`;
   else el.textContent=s;
   el.onmouseenter=()=>clearToastDismissTimer(el);
   el.onmouseleave=()=>setToastDismissTimer(el,duration);
   el.onfocusin=()=>clearToastDismissTimer(el);
   el.onfocusout=()=>setToastDismissTimer(el,duration);
-  el.onclick=t==='error'?null:()=>dismissToast(el);
   setToastDismissTimer(el,duration);
 }
 
@@ -4766,8 +3971,6 @@ function _stripForTTS(text){
   text=text.replace(/\[([^\]]+)\]\([^)]+\)/g,'$1');
   // Replace MEDIA: paths with a simple label
   text=text.replace(/MEDIA:[^\s]+/g,'a file');
-  // Strip emoji and emoticons
-  text=text.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{200D}]/gu,'');
   // Strip HTML tags that may leak through markdown
   text=text.replace(/<[^>]+>/g,' ');
   // Collapse whitespace
@@ -4775,137 +3978,20 @@ function _stripForTTS(text){
   return text;
 }
 
-function _splitForTTS(text, maxChars){
-  // Split long text into chunks at natural sentence/paragraph boundaries
-  // to avoid browser SpeechSynthesis truncation on long texts.
-  maxChars=maxChars||300;
-  if(text.length<=maxChars) return [text];
-  const chunks=[];
-  let remaining=text;
-  while(remaining.length>0){
-    if(remaining.length<=maxChars){ chunks.push(remaining); break; }
-    let splitAt=maxChars;
-    const sentencePattern=new RegExp('^[\\s\\S]{0,'+(maxChars-1)+'}[。！？.!？](?=\\s|$)','g');
-    const m=sentencePattern.exec(remaining);
-    if(m) splitAt=m.index+m[0].length;
-    else{
-      const sub=remaining.slice(0,maxChars);
-      const lastSpace=Math.max(sub.lastIndexOf(' '),sub.lastIndexOf('\n'),sub.lastIndexOf(','),sub.lastIndexOf('，'));
-      if(lastSpace>maxChars*0.5) splitAt=lastSpace+1;
-    }
-    chunks.push(remaining.slice(0,splitAt).trim());
-    remaining=remaining.slice(splitAt).trim();
-  }
-  return chunks.filter(Boolean);
-}
-
 let _ttsSpeaking=false;
 let _ttsCurrentUtterance=null;
-let _ttsChunkQueue=[];
-let _ttsChunkIndex=0;
-let _ttsActiveBtn=null;
-let _playingEdgeAudio=null;
-
-function _buildBrowserUtterance(text, btn){
-  const utter=new SpeechSynthesisUtterance(text);
-  const savedVoice=localStorage.getItem('hermes-tts-voice');
-  const voices=speechSynthesis.getVoices();
-  if(savedVoice&&voices.length){
-    const match=voices.find(v=>v.name===savedVoice);
-    if(match) utter.voice=match;
-  }
-  const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
-  if(!isNaN(savedRate)) utter.rate=Math.min(2,Math.max(0.5,savedRate));
-  const savedPitch=parseFloat(localStorage.getItem('hermes-tts-pitch'));
-  if(!isNaN(savedPitch)) utter.pitch=Math.min(2,Math.max(0,savedPitch));
-  utter.onend=()=>{
-    _ttsChunkIndex++;
-    if(_ttsChunkIndex<_ttsChunkQueue.length){
-      const next=new SpeechSynthesisUtterance(_ttsChunkQueue[_ttsChunkIndex]);
-      next.voice=utter.voice; next.rate=utter.rate; next.pitch=utter.pitch;
-      next.onend=utter.onend; next.onerror=utter.onerror;
-      _ttsCurrentUtterance=next;
-      speechSynthesis.speak(next);
-    } else {
-      _ttsSpeaking=false; _ttsCurrentUtterance=null;
-      _ttsChunkQueue=[]; _ttsChunkIndex=0; _ttsActiveBtn=null;
-      if(btn) btn.dataset.speaking='0';
-    }
-  };
-  utter.onerror=()=>{
-    _ttsSpeaking=false; _ttsCurrentUtterance=null;
-    _ttsChunkQueue=[]; _ttsChunkIndex=0; _ttsActiveBtn=null;
-    if(btn) btn.dataset.speaking='0';
-  };
-  return utter;
-}
-
-function _playEdgeTtsChunked(text, btn){
-  const chunks=_splitForTTS(text);
-  const _playOne=function(idx){
-    if(idx>=chunks.length){
-      _ttsSpeaking=false;_playingEdgeAudio=null;
-      if(btn) btn.dataset.speaking='0';
-      return;
-    }
-    const chunk=chunks[idx];
-    const voice=localStorage.getItem('hermes-tts-voice')||'zh-CN-XiaoxiaoNeural';
-    const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
-    const savedPitch=parseFloat(localStorage.getItem('hermes-tts-pitch'));
-    let rate='', pitch='';
-    if(!isNaN(savedRate)){const pct=Math.round((savedRate-1)*100);const sign=pct>=0?'+':'';rate=sign+pct+'%';}
-    if(!isNaN(savedPitch)){const hz=Math.round((savedPitch-1)*50);const sign=hz>=0?'+':'';pitch=sign+hz+'Hz';}
-    fetch(new URL('api/tts', document.baseURI || location.href).href, {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text:chunk, voice:voice, rate:rate, pitch:pitch})
-    })
-    .then(function(r){
-      if(!r.ok){
-        return r.json().catch(function(){return {};}).then(function(j){
-          throw new Error((j&&j.error)||('TTS request failed: '+r.status));
-        });
-      }
-      return r.blob();
-    })
-    .then(function(blob){
-      if(!_ttsSpeaking) return;
-      const url=URL.createObjectURL(blob);
-      const audio=new Audio(url);
-      _playingEdgeAudio=audio;
-      audio.onended=function(){
-        URL.revokeObjectURL(url);
-        _playingEdgeAudio=null;
-        if(_ttsSpeaking) _playOne(idx+1);
-      };
-      audio.onerror=function(){
-        URL.revokeObjectURL(url);
-        _playingEdgeAudio=null;
-        _ttsSpeaking=false;
-        if(btn) btn.dataset.speaking='0';
-      };
-      audio.play().catch(function(e){
-        URL.revokeObjectURL(url);
-        _playingEdgeAudio=null;
-        _ttsSpeaking=false;
-        if(btn) btn.dataset.speaking='0';
-        if(typeof showToast==='function') showToast('Edge TTS error: '+(e&&e.message||e));
-      });
-    })
-    .catch(function(e){
-      _ttsSpeaking=false;_playingEdgeAudio=null;
-      if(btn) btn.dataset.speaking='0';
-      if(typeof showToast==='function') showToast('Edge TTS failed: '+(e&&e.message||e));
-    });
-  };
-  _playOne(0);
-}
 
 function speakMessage(btn){
+  if(!('speechSynthesis' in window)){
+    showToast(t('tts_not_supported')||'Speech synthesis not supported in this browser.');
+    return;
+  }
+  // If already speaking this message, stop
   if(btn&&btn.dataset.speaking==='1'){
     stopTTS();
     return;
   }
+  // Stop any current speech
   stopTTS();
 
   const row=btn?btn.closest('[data-raw-text]'):null;
@@ -4915,25 +4001,29 @@ function speakMessage(btn){
   const clean=_stripForTTS(text);
   if(!clean) return;
 
-  const engine=localStorage.getItem('hermes-tts-engine')||'browser';
-  if(engine==='edge'){
-    _playEdgeTtsChunked(clean, btn);
-    return;
+  const utter=new SpeechSynthesisUtterance(clean);
+
+  // Apply saved voice preference
+  const savedVoice=localStorage.getItem('hermes-tts-voice');
+  const voices=speechSynthesis.getVoices();
+  if(savedVoice&&voices.length){
+    const match=voices.find(v=>v.name===savedVoice);
+    if(match) utter.voice=match;
   }
 
-  if(!('speechSynthesis' in window)){
-    showToast(t('tts_not_supported')||'Speech synthesis not supported in this browser.');
-    return;
-  }
+  // Apply saved rate/pitch
+  const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
+  if(!isNaN(savedRate)) utter.rate= Math.min(2,Math.max(0.5,savedRate));
+  const savedPitch=parseFloat(localStorage.getItem('hermes-tts-pitch'));
+  if(!isNaN(savedPitch)) utter.pitch=Math.min(2,Math.max(0,savedPitch));
 
-  _ttsChunkQueue=_splitForTTS(clean);
-  _ttsChunkIndex=0;
-  _ttsActiveBtn=btn;
+  _ttsCurrentUtterance=utter;
   _ttsSpeaking=true;
   if(btn) btn.dataset.speaking='1';
 
-  const utter=_buildBrowserUtterance(_ttsChunkQueue[0], btn);
-  _ttsCurrentUtterance=utter;
+  utter.onend=()=>{ _ttsSpeaking=false; _ttsCurrentUtterance=null; if(btn) btn.dataset.speaking='0'; };
+  utter.onerror=()=>{ _ttsSpeaking=false; _ttsCurrentUtterance=null; if(btn) btn.dataset.speaking='0'; };
+
   speechSynthesis.speak(utter);
 }
 
@@ -4941,23 +4031,14 @@ function stopTTS(){
   if('speechSynthesis' in window){
     speechSynthesis.cancel();
   }
-  // Stop Edge TTS audio
-  if(_playingEdgeAudio){
-    try{ _playingEdgeAudio.pause(); _playingEdgeAudio.currentTime=0; }catch(_){}
-    _playingEdgeAudio=null;
-  }
   _ttsSpeaking=false;
   _ttsCurrentUtterance=null;
-  _ttsChunkQueue=[];
-  _ttsChunkIndex=0;
-  _ttsActiveBtn=null;
   // Reset all speaking buttons
   document.querySelectorAll('[data-speaking="1"]').forEach(btn=>{ btn.dataset.speaking='0'; });
 }
 
 function autoReadLastAssistant(){
-  const engine=localStorage.getItem('hermes-tts-engine')||'browser';
-  if(engine==='browser'&&!('speechSynthesis' in window)) return;
+  if(!('speechSynthesis' in window)) return;
   const pref=localStorage.getItem('hermes-tts-auto-read');
   if(pref!=='true') return;
   // Find the last assistant message segment in the DOM
@@ -4968,16 +4049,19 @@ function autoReadLastAssistant(){
   if(!text.trim()) return;
   const clean=_stripForTTS(text);
   if(!clean) return;
-  if(engine==='edge'){
-    _playEdgeTtsChunked(clean, null);
-    return;
+
+  const utter=new SpeechSynthesisUtterance(clean);
+  const savedVoice=localStorage.getItem('hermes-tts-voice');
+  const voices=speechSynthesis.getVoices();
+  if(savedVoice&&voices.length){
+    const match=voices.find(v=>v.name===savedVoice);
+    if(match) utter.voice=match;
   }
-  // Use chunked playback for browser TTS
-  _ttsChunkQueue=_splitForTTS(clean);
-  _ttsChunkIndex=0;
-  _ttsSpeaking=true;
-  const utter=_buildBrowserUtterance(_ttsChunkQueue[0], null);
-  _ttsCurrentUtterance=utter;
+  const savedRate=parseFloat(localStorage.getItem('hermes-tts-rate'));
+  if(!isNaN(savedRate)) utter.rate=Math.min(2,Math.max(0.5,savedRate));
+  const savedPitch=parseFloat(localStorage.getItem('hermes-tts-pitch'));
+  if(!isNaN(savedPitch)) utter.pitch=Math.min(2,Math.max(0,savedPitch));
+
   speechSynthesis.speak(utter);
 }
 
@@ -5044,27 +4128,11 @@ function _compactInflightState(state){
   const limits=_getInflightStateLimits();
   const messages=Array.isArray(state.messages)?state.messages.slice(-limits.messages):[];
   const toolCalls=Array.isArray(state.toolCalls)?state.toolCalls.slice(-limits.toolCalls):[];
-  // Phase 2: persist the live todo snapshot so reload / SSE reattach
-  // restores the panel without waiting for the next live `todo` write.
-  // The list is bounded by the agent (typically <20 items) and each
-  // item is small, so no per-list cap is needed beyond the existing
-  // stringChars truncation in _truncateInflightValue.
-  const todos=Array.isArray(state.todos)?state.todos:null;
-  const todoStateMeta=(state.todoStateMeta&&typeof state.todoStateMeta==='object')?state.todoStateMeta:null;
   return _truncateInflightValue({
     streamId:state.streamId||null,
     messages,
     uploaded:Array.isArray(state.uploaded)?state.uploaded.slice(-20):[],
     toolCalls,
-    lastAssistantText:state.lastAssistantText||'',
-    lastReasoningText:state.lastReasoningText||'',
-    lastRunJournalSeq:state.lastRunJournalSeq||0,
-    journalReplayFromStart:!!state.journalReplayFromStart,
-    currentActivityBurstId:state.currentActivityBurstId||0,
-    currentLiveSegmentSeq:state.currentLiveSegmentSeq||0,
-    activityBurstAnchors:Array.isArray(state.activityBurstAnchors)?state.activityBurstAnchors.slice(-50):[],
-    todos,
-    todoStateMeta,
   }, limits.stringChars);
 }
 function _writeInflightStateMap(all){
@@ -5126,154 +4194,6 @@ function clearInflightState(sid){
   }catch(_){ }
 }
 
-// ─── Todo state: single source of truth + render scheduling ─────────────────
-//
-// Three concerns live together so they can share state cleanly:
-//
-//   1. _todosHash(items)  — cheap content fingerprint; skips re-render when
-//      a snapshot would paint the same DOM.  Used both as a short-circuit
-//      and as the hash that compares "rendered vs current" snapshots.
-//
-//   2. scheduleTodosRefresh() — coalesces multiple `todo_state` events that
-//      land in the same animation frame into a single loadTodos() call.
-//      Skips work entirely when the panel is not active.
-//
-//   3. _hydrateTodosFromSession(session) — applies cold-load todo_state
-//      from the session GET payload, or clears the panel when neither a
-//      cold-load nor an INFLIGHT signal is available.  Called at every
-//      `S.session = ...` settle point so cross-session navigation never
-//      leaves a stale list visible.
-//
-// The hash is keyed on (id, content, status); the render itself uses
-// `esc()` for any user-controlled string, so XSS surface is the same as
-// any other innerHTML path in this file.
-let _todosLastRenderedHash=null;
-let _todosRenderRafId=0;
-
-function _todosHash(items){
-  if(!Array.isArray(items)) return '';
-  // String concat outperforms JSON.stringify on small arrays in V8 (no
-  // intermediate object allocation) and is exact enough — the field set
-  // matches what the renderer reads, so any visible change in DOM
-  // implies a hash change.  Field separators (\x1f, \x1e) are control
-  // chars unlikely to appear in real todo content, so collisions across
-  // boundaries are not realistic.
-  let h=items.length+'|';
-  for(let i=0;i<items.length;i++){
-    const t=items[i]||{};
-    h+=String(t.id==null?'':t.id)+'\x1f'+String(t.content==null?'':t.content)+'\x1f'+String(t.status==null?'':t.status)+'\x1e';
-  }
-  return h;
-}
-
-function _todosPanelIsActive(){
-  if(typeof document==='undefined') return false;
-  const panel=document.getElementById('panelTodos');
-  return !!(panel&&panel.classList&&panel.classList.contains('active'));
-}
-
-function scheduleTodosRefresh(){
-  // Idempotent: many `todo_state` events fire on each tool result, but
-  // only the latest snapshot needs to paint.  RAF lets us coalesce
-  // without timer drift.
-  if(_todosRenderRafId) return;
-  if(typeof requestAnimationFrame!=='function'){
-    if(typeof loadTodos==='function') loadTodos();
-    return;
-  }
-  _todosRenderRafId=requestAnimationFrame(()=>{
-    _todosRenderRafId=0;
-    if(!_todosPanelIsActive()) return;
-    if(typeof loadTodos==='function') loadTodos();
-  });
-}
-
-function _resetTodosRenderCache(){
-  // Clear after every cross-session navigation so the next render is
-  // never short-circuited against a hash from a different session.
-  _todosLastRenderedHash=null;
-}
-
-function _hydrateTodosFromSession(session){
-  // Three input cases, three deterministic outcomes:
-  //   a) cold-load AND inflight both present  → pick newer by ts so a
-  //      stale cold-load from the session GET cannot regress a fresher
-  //      INFLIGHT snapshot persisted from a still-running stream
-  //      (avoids visible rollback on reload).
-  //   b) only one of cold-load / inflight is present  → use it.
-  //   c) neither  → reset to empty + sentinel so loadTodos() falls
-  //      through to the legacy reverse-scan or paints the empty state.
-  const sid=(session&&session.session_id)||'';
-  const inflight=(typeof INFLIGHT==='object'&&INFLIGHT&&sid)?INFLIGHT[sid]:null;
-  const cold=session&&session.todo_state;
-  const coldOk=!!(cold&&Array.isArray(cold.todos));
-  const inflightOk=!!(inflight&&Array.isArray(inflight.todos)&&inflight.todoStateMeta);
-  const coldTs=coldOk?(Number(cold.ts)||0):0;
-  const inflightTs=inflightOk?(Number(inflight.todoStateMeta&&inflight.todoStateMeta.ts)||0):0;
-  // Whether a live stream currently owns this session. This is the signal
-  // that disambiguates a ts-less cold-load (see below); it comes from the
-  // session GET payload (mirrors sessions.js `S.session.active_stream_id`).
-  const streamActive=!!(session&&session.active_stream_id);
-  if(coldOk&&inflightOk){
-    // Reconcile the server's settled cold-load snapshot against the
-    // locally-persisted INFLIGHT snapshot.
-    //
-    // coldTs===0 means the cold-load carries NO usable timestamp, so we
-    // cannot order it against INFLIGHT by recency. A todo tool message can
-    // legitimately lose its `timestamp` during context compression/rebuild
-    // (the on-disk message ends up timestamp=None), and derive_todo_state
-    // (api/todo_state.py) then returns the correct latest-by-POSITION todos
-    // but omits `ts`. The tie-break depends on who owns the INFLIGHT tail:
-    //
-    //   - stream ACTIVE → INFLIGHT is the live tail. The most recent todo
-    //     write may still be in flight and not yet settled into the message
-    //     list derive_todo_state scans, so a ts-less cold-load can be an
-    //     OLDER (pre-latest-write) view. Letting cold win here rolls the
-    //     panel back to a stale list, and since the stream may have just
-    //     ended on that very write there is no guaranteed forward SSE event
-    //     to self-heal. So prefer INFLIGHT. If cold is in fact newer, the
-    //     reattach replay (sessions.js attachLiveStream, reconnecting) re-
-    //     emits the journaled `todo_state` events which reconcile forward by
-    //     ts, so any transient discrepancy corrects itself.
-    //
-    //   - stream IDLE → INFLIGHT is leftover from a finished/crashed stream
-    //     (idle sessions purge it shortly after, sessions.js), and there is
-    //     no replay to correct anything. The settled cold-load is the
-    //     authoritative latest-by-position view, so prefer cold. This also
-    //     preserves the original fix for the "shows an old todo list" bug,
-    //     where a stale prior-turn INFLIGHT must not beat a ts-less cold-load.
-    //
-    // When coldTs>0 the original recency rule stands: strict ">", and on a
-    // tie prefer INFLIGHT for the freshest in-tab edits.
-    const coldWins=(coldTs===0)?(!streamActive):(coldTs>inflightTs);
-    if(coldWins){
-      S.todos=cold.todos;
-      S.todoStateMeta={
-        ts:coldTs,
-        source:'cold-load',
-        version:Number(cold.version)||1,
-      };
-    }else{
-      S.todos=inflight.todos;
-      S.todoStateMeta=inflight.todoStateMeta;
-    }
-  }else if(coldOk){
-    S.todos=cold.todos;
-    S.todoStateMeta={
-      ts:coldTs,
-      source:'cold-load',
-      version:Number(cold.version)||1,
-    };
-  }else if(inflightOk){
-    S.todos=inflight.todos;
-    S.todoStateMeta=inflight.todoStateMeta;
-  }else{
-    S.todos=[];
-    S.todoStateMeta=null;
-  }
-  _resetTodosRenderCache();
-}
-
 function snapshotLiveTurnHtmlForSession(sid){
   // Keep the DOM snapshot memory-only. Persisted INFLIGHT state intentionally
   // stores structured stream state, not outerHTML, so a hard reload still uses
@@ -5328,7 +4248,6 @@ function restoreLiveTurnHtmlForSession(sid){
   _mergeRestoredLiveAssistantSegment(restored, existing);
   if(existing) existing.replaceWith(restored);
   else inner.appendChild(restored);
-  if(typeof normalizeLiveActivityGroupPlacement==='function') normalizeLiveActivityGroupPlacement(restored);
   const liveGroup=restored.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
   if(liveGroup&&typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(liveGroup);
   if(typeof placeLiveToolCardsHost==='function') placeLiveToolCardsHost();
@@ -5426,7 +4345,7 @@ async function pollSystemHealth(){
   if(document.visibilityState !== 'visible') return;
   if(!_systemHealthPanelIsVisible()) return;
   try{
-    const payload=await api('/api/system/health',{timeoutToast:false});
+    const payload=await api('/api/system/health');
     renderSystemHealth(payload);
   }catch(_){
     setSystemHealthUnavailable('Unavailable');
@@ -5492,7 +4411,7 @@ function dismissAgentHealthAlert(){
 async function pollAgentHealth(){
   if(document.visibilityState !== 'visible') return;
   try{
-    const payload=await api('/api/health/agent',{timeoutToast:false});
+    const payload=await api('/api/health/agent');
     if(payload.alive === true){
       _agentHealthLastState='alive';
       _setAgentHealthDismissed(false);
@@ -5544,7 +4463,7 @@ async function refreshSession() {
     if(pendingMsg) S.messages.push(pendingMsg);
     S.activeStreamId=data.session.active_stream_id||null;
 
-    syncTopbar(); _renderMessagesWithScrollSnapshot();
+    syncTopbar(); renderMessages();
     showToast('Conversation refreshed');
   } catch(e) { setStatus('Refresh failed: ' + e.message); }
 }
@@ -5847,16 +4766,7 @@ async function applyUpdates(){
   const targets=[];
   if(window._updateData?.webui?.behind>0) targets.push('webui');
   if(window._updateData?.agent?.behind>0) targets.push('agent');
-  if(!targets.length){
-    const msg='No update target selected. Refresh update status and retry.';
-    if(errEl){errEl.textContent=msg;errEl.style.display='block';}
-    else showToast(msg,5000,'error');
-    resetApplyButton(0);
-    return;
-  }
   try{
-    const stashConflictMessages=[];
-    const baselineServerIdentity = await _readHealthServerIdentity();
     for(const target of targets){
       const res=await api('/api/updates/apply',{method:'POST',body:JSON.stringify({target}),timeoutMs:120000});
       if(!res.ok){
@@ -5864,16 +4774,11 @@ async function applyUpdates(){
         resetApplyButton(0);
         return;
       }
-      if(res.stash_conflict){
-        stashConflictMessages.push('Update applied ('+target+'): '+(res.message||'Local changes were preserved in git stash.'));
-        if(errEl){errEl.textContent=stashConflictMessages.join('\n\n');errEl.style.display='block';}
-      }
     }
-    const stashConflictMessage=stashConflictMessages.join('\n\n');
-    showToast(stashConflictMessage||'Update applied — restarting…',stashConflictMessages.length?10000:undefined,stashConflictMessages.length?'warning':undefined);
+    showToast('Update applied — restarting…');
     sessionStorage.removeItem('hermes-update-checked');
     sessionStorage.removeItem('hermes-update-dismissed');
-    _waitForServerThenReload({baselineServerIdentity});
+    _waitForServerThenReload();
   }catch(e){
     const msg=_formatUpdateApplyExceptionMessage(e);
     if(errEl){errEl.textContent=msg;errEl.style.display='block';}
@@ -5897,36 +4802,6 @@ function _showUpdateError(target,res){
     forceBtn.style.display='inline-block';
   }
 }
-function _normalizeHealthServerIdentity(rawIdentity){
-  if(rawIdentity===undefined||rawIdentity===null) return null;
-  if(typeof rawIdentity==='string'){
-    const value=rawIdentity.trim();
-    return value ? value : null;
-  }
-  const numeric=Number(rawIdentity);
-  return Number.isFinite(numeric) ? String(numeric) : null;
-}
-
-function _healthResponseServerIdentity(data){
-  if(!data||typeof data!=='object') return null;
-  const serverStartedAt=_normalizeHealthServerIdentity(data.server_started_at);
-  const hasUptimeSeconds=data.uptime_seconds!==null&&data.uptime_seconds!==undefined;
-  const uptimeSeconds=hasUptimeSeconds?Number(data.uptime_seconds):NaN;
-  const normalizedUptime=Number.isFinite(uptimeSeconds)&&uptimeSeconds>=0 ? uptimeSeconds : null;
-  if(serverStartedAt===null&&normalizedUptime===null) return null;
-  return {serverStartedAt,uptimeSeconds:normalizedUptime};
-}
-
-async function _readHealthServerIdentity() {
-  try {
-    const r=await fetch(new URL('health', document.baseURI||location.href).href,{cache:'no-store'});
-    if(!r.ok) return null;
-    const data=await r.json();
-    return _healthResponseServerIdentity(data);
-  } catch (_) {
-    return null;
-  }
-}
 async function forceUpdate(btn){
   const target=btn&&btn.dataset.target;
   if(!target) return;
@@ -5942,7 +4817,6 @@ async function forceUpdate(btn){
   const errEl=$('updateError');
   if(errEl){errEl.style.display='none';}
   try{
-    const baselineServerIdentity = await _readHealthServerIdentity();
     const res=await api('/api/updates/force',{method:'POST',body:JSON.stringify({target}),timeoutMs:120000});
     if(!res.ok){
       if(errEl){errEl.textContent='Force update failed: '+(res.message||'unknown error');errEl.style.display='block';}
@@ -5952,7 +4826,7 @@ async function forceUpdate(btn){
     showToast('Force update applied — restarting…');
     sessionStorage.removeItem('hermes-update-checked');
     sessionStorage.removeItem('hermes-update-dismissed');
-    _waitForServerThenReload({baselineServerIdentity});
+    _waitForServerThenReload();
   }catch(e){
     if(errEl){errEl.textContent='Force update failed: '+e.message;errEl.style.display='block';}
     btn.disabled=false;btn.textContent='Force update';
@@ -5967,36 +4841,12 @@ async function _waitForServerThenReload(opts){
   opts=opts||{};
   const interval=opts.interval||500;
   const maxMs=opts.maxMs||15000;
-  const baselineServerIdentity=(()=>{
-    const rawIdentity=opts.baselineServerIdentity;
-    if(!rawIdentity||typeof rawIdentity!=='object'){
-      const normalizedServerStartedAt=_normalizeHealthServerIdentity(rawIdentity);
-      return normalizedServerStartedAt===null ? null : {serverStartedAt:normalizedServerStartedAt,uptimeSeconds:null};
-    }
-    const normalizedIdentity={
-      serverStartedAt:_normalizeHealthServerIdentity(rawIdentity.serverStartedAt),
-      uptimeSeconds:Number.isFinite(Number(rawIdentity.uptimeSeconds))&&Number(rawIdentity.uptimeSeconds)>=0 ? Number(rawIdentity.uptimeSeconds) : null,
-    };
-    return normalizedIdentity.serverStartedAt===null&&normalizedIdentity.uptimeSeconds===null ? null : normalizedIdentity;
-  })();
   window._restartingForUpdate=true;
   const msgEl=$('reconnectMsg');
   const banner=$('reconnectBanner');
   if(msgEl) msgEl.textContent='⏳ Restarting… please wait';
   if(banner) banner.classList.add('visible');
   const deadline=Date.now()+maxMs;
-  // Track restart-outage evidence. An outage (failed or non-OK /health probes)
-  // followed by a healthy response is a reliable new-instance signal even when
-  // only uptime_seconds is comparable and the replacement's uptime is not strictly
-  // lower than the captured baseline (e.g. a deployment that strips
-  // server_started_at and whose baseline uptime was very low). We require at least
-  // TWO consecutive outage probes before trusting it, so a single transient network
-  // blip (with the OLD process still up and its uptime merely increasing) cannot
-  // trigger a premature reload onto the old server. Both thrown fetch errors AND
-  // non-OK responses (e.g. a reverse-proxy 502/503 during restart) count as outage
-  // evidence. (#3713 Codex catches)
-  let _consecutiveOutages=0;
-  const _restartOutageObserved=()=>_consecutiveOutages>=2;
   // Give the server a moment to actually begin its restart before the first
   // probe — otherwise the old process may still respond ok on the first poll.
   await new Promise(r=>setTimeout(r, interval));
@@ -6007,78 +4857,11 @@ async function _waitForServerThenReload(opts){
         let data={};
         try{ data=await r.json(); }catch(_){}
         if(data && data.status==='ok'){
-          const nextServerIdentity=_healthResponseServerIdentity(data);
-          if (baselineServerIdentity===null){
-            location.reload();
-            return;
-          }
-          if(
-            nextServerIdentity===null &&
-            (
-              baselineServerIdentity.serverStartedAt!==null ||
-              baselineServerIdentity.uptimeSeconds!==null
-            )
-          ){
-            // If the replacement server comes back healthy without either
-            // identity field after the baseline exposed a comparable identity,
-            // treat that healthy response as the new server instead of timing
-            // out on an uncomparable identity shape.
-            location.reload();
-            return;
-          }
-          if(
-            nextServerIdentity!==null &&
-            baselineServerIdentity.serverStartedAt!==null &&
-            nextServerIdentity.serverStartedAt===null &&
-            nextServerIdentity.uptimeSeconds!==null
-          ){
-            // If the baseline exposed server_started_at but the replacement
-            // health response degrades to uptime-only, there is no longer a
-            // comparable started_at field. Treat the first healthy uptime-only
-            // response as the new server instead of timing out.
-            location.reload();
-            return;
-          }
-          if(
-            nextServerIdentity!==null&&(
-              (baselineServerIdentity.serverStartedAt===null&&nextServerIdentity.serverStartedAt!==null)||
-              (baselineServerIdentity.serverStartedAt!==null&&nextServerIdentity.serverStartedAt!==null&&nextServerIdentity.serverStartedAt!==baselineServerIdentity.serverStartedAt)||
-              (baselineServerIdentity.uptimeSeconds!==null&&nextServerIdentity.uptimeSeconds!==null&&nextServerIdentity.uptimeSeconds<baselineServerIdentity.uptimeSeconds)
-            )
-          ){
-            location.reload();
-            return;
-          }
-          if(
-            _restartOutageObserved() &&
-            nextServerIdentity!==null &&
-            baselineServerIdentity.serverStartedAt===null &&
-            nextServerIdentity.serverStartedAt===null &&
-            baselineServerIdentity.uptimeSeconds!==null &&
-            nextServerIdentity.uptimeSeconds!==null
-          ){
-            // Uptime-only on both sides AND we saw a sustained restart outage
-            // (>=2 consecutive failed/non-OK probes) before this healthy response:
-            // treat that outage as the restart, so reload even though the
-            // replacement uptime is not strictly lower than a very-low baseline.
-            location.reload();
-            return;
-          }
-          // Healthy response still describing the pre-restart process: this is the
-          // OLD server answering, so any earlier outage was a transient blip, not a
-          // restart — reset the outage evidence so it can't accumulate into a false
-          // positive across unrelated blips.
-          _consecutiveOutages=0;
-          // Keep polling while /health still describes the pre-restart process.
-        }else{
-          // Reachable but not status:ok (still starting up) — counts as outage.
-          _consecutiveOutages++;
+          location.reload();
+          return;
         }
-      }else{
-        // Non-OK HTTP (e.g. reverse-proxy 502/503 during restart) — outage evidence.
-        _consecutiveOutages++;
       }
-    }catch(_){ _consecutiveOutages++; /* socket closed during restart — retry */ }
+    }catch(_){ /* socket closed during restart — retry */ }
     await new Promise(r=>setTimeout(r, interval));
   }
   if(msgEl) msgEl.textContent='⚠️ Server is taking longer than expected — click Reload when ready';
@@ -6132,24 +4915,6 @@ async function checkInflightOnBoot(sid) {
   } catch(e) { clearInflight(); }
 }
 
-function _topbarLoadedMessageCount(){
-  const messages=Array.isArray(S.messages)?S.messages:[];
-  return messages.filter(m=>m&&m.role&&m.role!=='tool').length;
-}
-function _topbarMessageMetaText(){
-  const loadedCount=_topbarLoadedMessageCount();
-  const totalCount=Number(S.session&&S.session.message_count);
-  const hasTotal=Number.isFinite(totalCount)&&totalCount>0;
-  const isTruncated=!!(typeof _messagesTruncated!=='undefined'&&_messagesTruncated);
-  if(isTruncated&&hasTotal&&totalCount>loadedCount){
-    return `${loadedCount} loaded of ${totalCount} messages`;
-  }
-  // Fully loaded: use the tool-row-filtered loadedCount, NOT the raw server
-  // total (api/routes.py sets message_count to len(_all_msgs), which counts
-  // role:"tool" rows the topbar has always excluded). Only the truncated
-  // branch above surfaces the raw server total, and only as "loaded of total".
-  return t('n_messages',loadedCount);
-}
 function syncTopbar(){
   if(!S.session){
     document.title=assistantDisplayName();
@@ -6173,12 +4938,11 @@ function syncTopbar(){
   const sessionTitle=S.session.title||t('untitled');
   const _topbarTitle=$('topbarTitle');if(_topbarTitle)_topbarTitle.textContent=sessionTitle;
   document.title=sessionTitle+' \u2014 '+assistantDisplayName();
+  const vis=S.messages.filter(m=>m&&m.role&&m.role!=='tool');
   const _topbarMeta=$('topbarMeta');
   if(_topbarMeta){
-    let sourceLabel=(S.session&&(S.session.source_label||S.session.source_tag||S.session.raw_source))||'';
-    // Recovered sidecars stamp source_label 'WebUI' (api/session_recovery.py); don't badge a native session as its own source (#3338).
-    if(/^webui$/i.test(sourceLabel)) sourceLabel='';
-    const metaText=_topbarMessageMetaText();
+    const sourceLabel=(S.session&&S.session.is_cli_session&&(S.session.source_label||S.session.source_tag||S.session.raw_source))||'';
+    const metaText=t('n_messages',vis.length);
     _topbarMeta.textContent=metaText;
     if(sourceLabel){
       const badge=document.createElement('span');
@@ -6277,17 +5041,7 @@ function syncTopbar(){
   if(typeof syncWorkspaceDisplays==='function') syncWorkspaceDisplays();
   if(typeof syncTerminalButton==='function') syncTerminalButton();
   // modelSelect already set above
-  // Update profile chip label.
-  // The chip is the profile-SWITCHER trigger (it fronts the profile dropdown) and
-  // governs where the next message / new chat routes — both follow the client
-  // active profile (the hermes_profile cookie, set only by /api/profile/switch).
-  // It must therefore reflect S.activeProfile, NOT the loaded session's profile.
-  // #3331 briefly keyed this on S.session.profile so the label would track the
-  // session being browsed, but loadSession() never updates S.activeProfile, so
-  // opening a cross-profile session made the chip disagree with the dropdown
-  // checkmark and lie about message routing (#3635). #3331's legitimate work —
-  // scoping project/session operations to the session's own profile — is
-  // unaffected by this line.
+  // Update profile chip label
   const profileLabel=$('profileChipLabel');
   if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
 }
@@ -6297,39 +5051,6 @@ function msgContent(m){
   let c=m.content||'';
   if(Array.isArray(c))c=c.filter(p=>p&&p.type==='text').map(p=>p.text||'').join('').trim();
   return String(c).trim();
-}
-
-function _isRecoveryControlMessageText(text){
-  const normalized=String(text||'').replace(/\s+/g,' ').trim();
-  if(!normalized) return false;
-  const systemRecovery=/^\[System:/i.test(normalized)
-    && /previous response was cut off by a network error/i.test(normalized)
-    && /continue exactly where you left off/i.test(normalized);
-  const backendRecovery=/^the live worker stopped before this run finished\.?$/i.test(normalized);
-  return !!(systemRecovery || backendRecovery);
-}
-function _isRecoveryControlMessage(m){
-  if(!m||m.role==='tool') return false;
-  if(m.recovery_control===true) return true;
-  // Backward-compat ONLY: strict fully-anchored text match for pre-marker
-  // persisted sessions. NOT provider_details_label — a real "Response
-  // interrupted" card carries 'Interruption details' and must stay visible.
-  return _isRecoveryControlMessageText(msgContent(m)||String(m.content||''));
-}
-function _assistantMessageHasVisibleContent(m){
-  if(!m||m.role!=='assistant') return false;
-  if(_isRecoveryControlMessage(m)) return false;
-  const content=m.content;
-  if(typeof content==='string') return !_isAssistantEmptyPlaceholderContent(m, content)&&!!content.trim();
-  if(!Array.isArray(content)) return false;
-  return content.some(part=>{
-    if(typeof part==='string') return !!part.trim();
-    if(!part||typeof part!=='object') return false;
-    if(part.type==='text'||part.type==='input_text'||part.type==='output_text'){
-      return !!String(part.text||part.content||'').trim();
-    }
-    return false;
-  });
 }
 
 function _fmtDateSep(d){
@@ -6346,18 +5067,9 @@ function _fmtDateSep(d){
 const _ERR_MSG_RE=/^(?:\*\*error\b|error:|connection lost|no response received)/i;
 function _messageHasReasoningPayload(m){
   if(!m||m.role!=='assistant') return false;
-  if(m.reasoning||m.reasoning_content||m.thinking||m._reasoning) return true;
+  if(m.reasoning) return true;
   if(Array.isArray(m.content)) return m.content.some(p=>p&&(p.type==='thinking'||p.type==='reasoning'));
-  if(typeof window!=='undefined'&&typeof window._extractInlineThinkingFromContentForRender==='function'){
-    const split=window._extractInlineThinkingFromContentForRender(String(m.content||''),'');
-    return !!(split&&split.reasoning);
-  }
   return /^\s*(?:<think>[\s\S]*?<\/think>|<\|channel\|?>thought\n?[\s\S]*?<channel\|>|<\|turn\|>thinking\n[\s\S]*?<turn\|>)/.test(String(m.content||''));
-}
-function _isAssistantEmptyPlaceholderContent(m, content){
-  if(!m||m.role!=='assistant') return false;
-  if(String(content||'').trim()!=='(empty)') return false;
-  return _messageHasReasoningPayload(m);
 }
 function _formatTurnTps(value){
   const n=Number(value);
@@ -6402,159 +5114,10 @@ function _createAssistantTurn(tsTitle='', tpsText=''){
 function _assistantTurnBlocks(turn){
   return turn?turn.querySelector('.assistant-turn-blocks'):null;
 }
-function _assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, visibleContent, opts){
-  if(!m||m.role!=='assistant') return false;
-  const isTurnFinalAssistant=!!(opts&&opts.isTurnFinalAssistant);
-  const visibleText=String(visibleContent!==undefined?visibleContent:msgContent(m)||'').trim();
-  const hasVisibleText=!!visibleText&&!_isAssistantEmptyPlaceholderContent(m, visibleText);
-  if(m._live) return true;
-  if(hasVisibleText&&isTurnFinalAssistant) return false;
-  if(m._activityBurstId!==undefined||m._liveSegmentSeq!==undefined) return true;
-  const hasToolMetadata=!!(
-    (toolCallAssistantIdxs&&toolCallAssistantIdxs.has(rawIdx))||
-    (Array.isArray(m.tool_calls)&&m.tool_calls.length)||
-    (Array.isArray(m.content)&&m.content.some(p=>p&&typeof p==='object'&&p.type==='tool_use'))
-  );
-  if(hasVisibleText) return false;
-  if(hasToolMetadata) return true;
-  return false;
-}
-function _assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs){
-  return !!_assistantReasoningPayloadText(m)||_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs);
-}
-function _assistantReasoningPayloadText(m){
-  if(!m||m.role!=='assistant') return '';
-  const direct=m.reasoning_content||m.reasoning||m.thinking||m._reasoning||'';
-  if(String(direct||'').trim()) return String(direct).trim();
-  if(Array.isArray(m.content)){
-    const parts=m.content
-      .filter(p=>p&&typeof p==='object'&&(p.type==='thinking'||p.type==='reasoning'))
-      .map(p=>p.text||p.content||'')
-      .filter(text=>String(text||'').trim());
-    return parts.join('\n').trim();
-  }
-  const text=String(m.content||'');
-  if(typeof window!=='undefined'&&typeof window._extractInlineThinkingFromContentForRender==='function'){
-    const split=window._extractInlineThinkingFromContentForRender(text,'');
-    if(split&&String(split.reasoning||'').trim()) return String(split.reasoning).trim();
-  }
-  // Extract a LEADING thinking block even when visible answer text follows it
-  // (e.g. "<think>…</think>4"). The matching display-content stripper
-  // (_stripLeadingAssistantThinkingMarkup) is non-anchored, so the extractor must
-  // be too — a trailing `$` anchor here dropped the reasoning whenever the turn
-  // also had a visible answer, hiding the Thinking card entirely (#3401 regression
-  // vs master, which used the non-anchored form). (#3709/#3592 family)
-  const thinkMatch=text.match(/^\s*<think>([\s\S]*?)<\/think>\s*/);
-  if(thinkMatch) return thinkMatch[1].trim();
-  const thoughtMatch=text.match(/^\s*<\|channel\|?>thought\n?([\s\S]*?)<channel\|>\s*/);
-  if(thoughtMatch) return thoughtMatch[1].trim();
-  const turnMatch=text.match(/^\s*<\|turn\|>thinking\n([\s\S]*?)<turn\|>\s*/);
-  if(turnMatch) return turnMatch[1].trim();
-  return '';
-}
-function _stripLeadingAssistantThinkingMarkup(content){
-  let out=String(content||'');
-  const thinkMatch=out.match(/^\s*<think>([\s\S]*?)<\/think>\s*/);
-  if(thinkMatch) out=out.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'').trimStart();
-  const thoughtMatch=out.match(/^\s*<\|channel\|?>thought\n?([\s\S]*?)<channel\|>\s*/);
-  if(thoughtMatch) out=out.replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'').trimStart();
-  const turnMatch=out.match(/^\s*<\|turn\|>thinking\n([\s\S]*?)<turn\|>\s*/);
-  if(turnMatch) out=out.replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trimStart();
-  return out;
-}
-function _assistantVisibleContentForReasoningCompare(m){
-  if(!m||m.role!=='assistant') return '';
-  let content=m.content||'';
-  if(Array.isArray(content)){
-    content=content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
-  }
-  if(typeof content==='string'){
-    if(typeof window!=='undefined'&&typeof window._extractInlineThinkingFromContentForRender==='function'){
-      const split=window._extractInlineThinkingFromContentForRender(content,'');
-      content=split&&typeof split.content==='string'?split.content:_stripLeadingAssistantThinkingMarkup(content);
-    } else {
-      content=_stripLeadingAssistantThinkingMarkup(content);
-    }
-  }
-  if(_isMarkerOnlyAssistantCompressionMessage(m)){
-    content='**Error:** No response received after context compression. Please retry.';
-  }
-  if(_isAssistantEmptyPlaceholderContent(m, content)) return '';
-  return String(content||'');
-}
-function _assistantTurnFinalVisibleContentMap(visWithIdx){
-  const out=new Map();
-  let runIdxs=[];
-  let finalVisible='';
-  const flush=()=>{
-    for(const idx of runIdxs) out.set(idx, finalVisible);
-    runIdxs=[];
-    finalVisible='';
-  };
-  for(const entry of visWithIdx||[]){
-    const m=entry&&entry.m;
-    if(m&&m.role==='assistant'){
-      runIdxs.push(entry.rawIdx);
-      const visible=_assistantVisibleContentForReasoningCompare(m);
-      if(String(visible||'').trim()) finalVisible=visible;
-    }else{
-      flush();
-    }
-  }
-  flush();
-  return out;
-}
-function _assistantTurnVisibleContentMap(visWithIdx){
-  const out=new Map();
-  let runIdxs=[];
-  let visibleTexts=[];
-  const flush=()=>{
-    for(const idx of runIdxs) out.set(idx, visibleTexts.slice());
-    runIdxs=[];
-    visibleTexts=[];
-  };
-  for(const entry of visWithIdx||[]){
-    const m=entry&&entry.m;
-    if(m&&m.role==='assistant'){
-      runIdxs.push(entry.rawIdx);
-      const visible=_assistantVisibleContentForReasoningCompare(m);
-      if(String(visible||'').trim()) visibleTexts.push(visible);
-    }else{
-      flush();
-    }
-  }
-  flush();
-  return out;
-}
-function _worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, visibleContent, turnFinalVisibleContent, turnVisibleContents){
-  const thinkingText=_assistantReasoningPayloadText(m);
-  const visibleTexts=Array.isArray(turnVisibleContents)?turnVisibleContents:[];
-  return _stripVisibleAssistantEchoFromThinking(thinkingText, visibleContent, turnFinalVisibleContent, ...visibleTexts);
-}
-function _worklogDetailsExpandedDefault(){
-  return window._worklogDetailsExpandedByDefault===true;
-}
-function _applyWorklogDetailsExpandedDefault(root){
-  const scope=root&&root.querySelectorAll?root:document;
-  const open=_worklogDetailsExpandedDefault();
-  scope.querySelectorAll('.thinking-card').forEach(card=>{
-    card.classList.toggle('open', open);
-  });
-  scope.querySelectorAll('.tool-card').forEach(card=>{
-    if(card.querySelector('.tool-card-detail')) card.classList.toggle('open', open);
-  });
-  scope.querySelectorAll('.tool-group[data-tool-worklog-tool-group="1"],.tool-worklog-tool-group').forEach(group=>{
-    group.classList.toggle('open', open);
-    group.classList.toggle('tool-worklog-tool-group-collapsed', !open);
-    const summary=group.querySelector('.tool-group-head,.tool-worklog-tool-group-head');
-    if(summary) summary.setAttribute('aria-expanded', String(open));
-  });
-}
 function _thinkingCardHtml(text, open){
   const clean=_sanitizeThinkingDisplayText(text);
   const copyBtn=`<button class="thinking-copy-btn" onclick="event.stopPropagation();_copyThinkingText(this)" title="${t('copy')}" aria-label="${t('copy')}">${li('copy',12)}</button>`;
-  const shouldOpen=!!open||_worklogDetailsExpandedDefault();
-  const classes=`thinking-card${shouldOpen?' open':''}`;
+  const classes=`thinking-card${open?' open':''}`;
   return `<div class="${classes}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
 }
 function isSimplifiedToolCalling(){
@@ -6563,9 +5126,7 @@ function isSimplifiedToolCalling(){
 function _thinkingActivityNode(text, open){
   const row=document.createElement('div');
   row.className='agent-activity-thinking';
-  row.setAttribute('data-worklog-thinking-card','1');
   row.innerHTML=_thinkingCardHtml(text, open);
-  _renderThinkingInto(row,text);
   return row;
 }
 // ── Activity-group user expand intent (#1298) ──────────────────────────────
@@ -6615,236 +5176,12 @@ function _onLiveActivityToggle(group){
   _liveActivityUserExpanded = !group.classList.contains('tool-call-group-collapsed');
 }
 function _toggleActivityGroup(summary){
-  const group=summary&&summary.closest?summary.closest('.agent-activity-group,.tool-call-group'):null;
+  const group=summary&&summary.closest?summary.closest('.tool-call-group'):null;
   if(!group) return;
   const collapsed=group.classList.toggle('tool-call-group-collapsed');
-  group.classList.toggle('open',!collapsed);
   summary.setAttribute('aria-expanded',String(!collapsed));
   _writeActivityDisclosureState(group.getAttribute('data-activity-disclosure-key'), !collapsed);
   if(typeof _onLiveActivityToggle==='function') _onLiveActivityToggle(group);
-}
-function _toggleToolWorklogGroup(summary){
-  const group=summary&&summary.closest?summary.closest('.tool-worklog-tool-group,.tool-group'):null;
-  if(group){
-    const collapsed=group.classList.toggle('tool-worklog-tool-group-collapsed');
-    group.classList.toggle('open',!collapsed);
-    summary.setAttribute('aria-expanded',String(!collapsed));
-    return;
-  }
-  return _toggleActivityGroup(summary);
-}
-function _worklogReasonHtmlFromAnchor(anchor, textOverride){
-  if(!anchor||!anchor.matches||!anchor.matches('.assistant-segment')) return '';
-  const body=anchor.querySelector&&anchor.querySelector('.msg-body');
-  const hasOverride=arguments.length>1;
-  const text=hasOverride?String(textOverride||''):((body?body.textContent:anchor.textContent)||'');
-  if(!String(text||'').trim()) return '';
-  if(String(text||'').trim()==='(empty)') return '';
-  if(hasOverride) return _worklogReasonHtmlFromText(text);
-  return body?body.innerHTML:esc(String(text||'').trim());
-}
-function _worklogReasonHtmlFromText(text){
-  const clean=_sanitizeThinkingDisplayText(text);
-  if(!String(clean||'').trim()) return '';
-  if(String(clean||'').trim()==='(empty)') return '';
-  return renderMd?renderMd(clean):esc(clean);
-}
-function _renderWorklogReasonInto(row, text){
-  if(!row) return;
-  const html=_worklogReasonHtmlFromText(text);
-  row.innerHTML=html;
-}
-function _worklogReasonNodeFromText(text, attrs){
-  const html=_worklogReasonHtmlFromText(text);
-  if(!html) return null;
-  const row=document.createElement('div');
-  row.className='wl-reason';
-  row.setAttribute('data-worklog-reason-source','reasoning');
-  if(attrs&&attrs.active) row.setAttribute('data-worklog-reason-active','1');
-  row.innerHTML=html;
-  return row;
-}
-let _worklogAnchorKeySeq=0;
-function _worklogReasonAnchorKey(anchor){
-  if(!anchor||!anchor.dataset) return '';
-  if(anchor.dataset.worklogAnchorKey) return anchor.dataset.worklogAnchorKey;
-  const segmentSeq=anchor.getAttribute('data-live-segment-seq')||'';
-  const burstId=anchor.getAttribute('data-activity-burst-id')||'';
-  const msgIdx=anchor.getAttribute('data-msg-idx')||'';
-  const raw=String(anchor.getAttribute('data-raw-text')||anchor.textContent||'').trim().slice(0,80);
-  const key=segmentSeq
-    ? `segment:${segmentSeq}`
-    : msgIdx
-    ? `msg:${msgIdx}`
-    : burstId&&raw
-    ? `burst:${burstId}:${raw}`
-    : burstId
-    ? `burst:${burstId}`
-    : `node:${++_worklogAnchorKeySeq}`;
-  anchor.dataset.worklogAnchorKey=key;
-  return key;
-}
-function _syncWorklogReasonFromAnchor(group, anchor, displayTextOverride){
-  const list=_toolWorklogListEl(group);
-  if(!group||!list) return;
-  const anchorKey=_worklogReasonAnchorKey(anchor);
-  const html=arguments.length>2
-    ? _worklogReasonHtmlFromAnchor(anchor, displayTextOverride)
-    : _worklogReasonHtmlFromAnchor(anchor);
-  const selector=anchorKey?`:scope > .wl-reason[data-worklog-anchor-key="${CSS.escape(anchorKey)}"]`:':scope > .wl-reason[data-worklog-anchor-reason="1"]';
-  let reason=list.querySelector(selector);
-  if(!html){
-    if(reason) reason.remove();
-    return;
-  }
-  if(!reason){
-    reason=document.createElement('div');
-    reason.className='wl-reason';
-    reason.setAttribute('data-worklog-anchor-reason','1');
-    if(anchorKey) reason.setAttribute('data-worklog-anchor-key',anchorKey);
-    list.appendChild(reason);
-  }
-  reason.innerHTML=html;
-  if(anchor){
-    anchor.classList.add('assistant-segment-worklog-source');
-    anchor.setAttribute('aria-hidden','true');
-  }
-}
-function ensureLiveWorklogContainer(blocks, opts){
-  opts=opts||{};
-  if(!blocks) return null;
-  const activityKey=opts.activityKey||_activityKeyForLiveTurn();
-  let worklog=activityKey
-    ? blocks.querySelector(`.live-worklog[data-live-worklog-shell="1"][data-tool-worklog-key="${CSS.escape(activityKey)}"]`)
-    : null;
-  if(!worklog) worklog=blocks.querySelector('.live-worklog[data-live-worklog-shell="1"][data-live-activity-current="1"]');
-  if(!worklog){
-    worklog=document.createElement('div');
-    worklog.className='live-worklog worklog';
-    worklog.setAttribute('data-live-worklog-shell','1');
-    worklog.setAttribute('data-live-tool-worklog-group','1');
-    worklog.setAttribute('data-live-tool-call-group','1');
-    worklog.setAttribute('data-live-activity-current','1');
-    worklog.setAttribute('data-tool-worklog-group','1');
-    worklog.setAttribute('data-tool-worklog-key',activityKey||'');
-    worklog.innerHTML='<div class="tool-worklog-list"></div>';
-    const anchor=opts.anchor||null;
-    const footer=blocks.querySelector('#liveRunStatus');
-    if(anchor&&anchor.parentElement===blocks) anchor.insertAdjacentElement('afterend',worklog);
-    else if(footer&&footer.parentElement===blocks) blocks.insertBefore(worklog,footer);
-    else blocks.appendChild(worklog);
-  }else if(activityKey&&!worklog.getAttribute('data-tool-worklog-key')){
-    worklog.setAttribute('data-tool-worklog-key',activityKey);
-  }
-  if(opts.anchor) _syncWorklogReasonFromAnchor(worklog, opts.anchor);
-  _migrateLegacyLiveActivityGroupsToWorklog(blocks, worklog);
-  _syncToolCallGroupSummary(worklog);
-  return worklog;
-}
-function _migrateLegacyLiveActivityGroupsToWorklog(blocks, worklog){
-  if(!blocks||!worklog) return;
-  const list=_toolWorklogListEl(worklog);
-  if(!list) return;
-  const legacy=Array.from(blocks.querySelectorAll('.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"]'))
-    .filter(group=>group!==worklog && !group.classList.contains('live-worklog'));
-  for(const group of legacy){
-    const oldList=_toolWorklogListEl(group);
-    if(oldList){
-      while(oldList.firstChild) list.appendChild(oldList.firstChild);
-    }
-    group.remove();
-  }
-}
-function _appendWorklogReason(list, anchor){
-  if(!list) return null;
-  const html=_worklogReasonHtmlFromAnchor(anchor);
-  if(!html) return null;
-  const reason=document.createElement('div');
-  reason.className='wl-reason';
-  reason.setAttribute('data-worklog-anchor-reason','1');
-  const anchorKey=_worklogReasonAnchorKey(anchor);
-  if(anchorKey) reason.setAttribute('data-worklog-anchor-key',anchorKey);
-  reason.innerHTML=html;
-  list.appendChild(reason);
-  if(anchor){
-    anchor.classList.add('assistant-segment-worklog-source');
-    anchor.setAttribute('aria-hidden','true');
-  }
-  return reason;
-}
-function _toolIdentity(tc){
-  if(!tc) return '';
-  const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
-  if(tid) return `id:${tid}`;
-  const args=tc.args&&typeof tc.args==='object'?tc.args:{};
-  return [
-    tc.assistant_msg_idx!==undefined?`a:${tc.assistant_msg_idx}`:'',
-    tc.name||'tool',
-    JSON.stringify(args),
-    String(tc.snippet||tc.preview||'').slice(0,160),
-  ].join('|');
-}
-function _filterNewWorklogTools(cards, seenTools){
-  const out=[];
-  for(const tc of Array.from(cards||[]).filter(Boolean)){
-    const key=_toolIdentity(tc);
-    if(key&&seenTools&&seenTools.has(key)) continue;
-    if(key&&seenTools) seenTools.add(key);
-    out.push(tc);
-  }
-  return out;
-}
-function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
-  const list=_toolWorklogListEl(group);
-  if(!group||!list) return;
-  let wroteProse=false;
-  const seenReasons=opts&&opts.seenReasons;
-  if(!opts||opts.includeAnchorReason!==false){
-    const anchorKey=anchor&&anchor.dataset&&anchor.dataset.msgIdx?`anchor:${anchor.dataset.msgIdx}`:'';
-    if(!anchorKey||!seenReasons||!seenReasons.has(anchorKey)){
-      const reason=_appendWorklogReason(list, anchor);
-      if(reason){
-        wroteProse=true;
-        if(anchorKey&&seenReasons) seenReasons.add(anchorKey);
-      }
-    }
-  }
-  if(thinkingText){
-    const thinkingKey=(opts&&opts.thinkingKey)||`reason:${String(thinkingText).trim()}`;
-    if(!seenReasons||!seenReasons.has(thinkingKey)){
-      const thinking=_thinkingActivityNode(thinkingText, false);
-      if(thinking){
-        list.appendChild(thinking);
-        wroteProse=true;
-        if(seenReasons) seenReasons.add(thinkingKey);
-      }
-    }
-  }
-  const toolCards=_filterNewWorklogTools(cards, opts&&opts.seenTools);
-  if(toolCards.length){
-    const last=list.lastElementChild;
-    let tools=(!wroteProse&&last&&last.classList&&last.classList.contains('wl-step-tools')&&last.getAttribute('data-worklog-tools')==='1')
-      ? last
-      : null;
-    if(!tools){
-      tools=document.createElement('div');
-      tools.className='wl-step-tools tool-worklog-tools';
-      tools.setAttribute('data-worklog-tools','1');
-      list.appendChild(tools);
-    }
-    for(const tc of toolCards) tools.appendChild(buildToolCard(tc));
-    _syncToolRowsContainer(tools, !!(opts&&opts.live));
-  }
-}
-function _syncLiveWorklogReasonsForAnchor(anchor, displayTextOverride){
-  if(!anchor||!anchor.matches||!anchor.matches('[data-live-assistant="1"]')) return;
-  const blocks=anchor.parentElement;
-  if(!blocks) return;
-  const group=ensureLiveWorklogContainer(blocks,{
-    activityKey:_activityKeyForLiveTurn(),
-    anchor,
-  });
-  if(group) _syncWorklogReasonFromAnchor(group, anchor, displayTextOverride);
 }
 function _clearLiveActivityUserIntent(){
   _liveActivityUserExpanded = undefined;
@@ -6854,283 +5191,43 @@ function ensureActivityGroup(inner, opts){
   if(!inner) return null;
   const live=!!opts.live;
   const activityKey=opts.activityKey||(live?_activityKeyForLiveTurn():null);
-  const burstId=opts.burstId!==undefined&&opts.burstId!==null?String(opts.burstId):'';
-  const segmentSeq=opts.segmentSeq!==undefined&&opts.segmentSeq!==null?String(opts.segmentSeq):'';
-  const liveSelectors=segmentSeq
-    ? [
-      `.tool-worklog-group[data-live-tool-worklog-group="1"][data-live-segment-seq="${CSS.escape(segmentSeq)}"]`,
-      `.tool-call-group[data-live-tool-worklog-group="1"][data-live-segment-seq="${CSS.escape(segmentSeq)}"]`,
-      `.tool-call-group[data-live-tool-call-group="1"][data-live-segment-seq="${CSS.escape(segmentSeq)}"]`,
-    ]
-    : burstId
-    ? [
-      `.tool-worklog-group[data-live-tool-worklog-group="1"][data-activity-burst-id="${CSS.escape(burstId)}"]`,
-      `.tool-call-group[data-live-tool-worklog-group="1"][data-activity-burst-id="${CSS.escape(burstId)}"]`,
-      `.tool-call-group[data-live-tool-call-group="1"][data-activity-burst-id="${CSS.escape(burstId)}"]`,
-    ]
-    : [
-      '.tool-worklog-group[data-live-tool-worklog-group="1"][data-live-activity-current="1"]',
-      '.tool-call-group[data-live-tool-worklog-group="1"][data-live-activity-current="1"]',
-      '.tool-call-group[data-live-tool-call-group="1"][data-live-activity-current="1"]',
-    ];
-  let group;
-  if(live){
-    if(activityKey){
-      group=inner.querySelector(`.tool-worklog-group[data-tool-worklog-key="${CSS.escape(activityKey)}"],.tool-call-group[data-tool-worklog-key="${CSS.escape(activityKey)}"]`);
-    }
-    if(!group){
-      for(const sel of liveSelectors){
-        group=inner.querySelector(sel);
-        if(group) break;
-      }
-    }
-  }else{
-    if(activityKey){
-      group=inner.querySelector(`.tool-worklog-group[data-agent-activity-group="1"][data-tool-worklog-group="1"][data-tool-worklog-key="${CSS.escape(activityKey)}"],.tool-call-group[data-agent-activity-group="1"][data-tool-worklog-group="1"][data-tool-worklog-key="${CSS.escape(activityKey)}"]`);
-    }
-    if(!group&&segmentSeq){
-      group=inner.querySelector(`.tool-worklog-group[data-agent-activity-group="1"][data-tool-worklog-group="1"][data-live-segment-seq="${CSS.escape(segmentSeq)}"],.tool-call-group[data-agent-activity-group="1"][data-tool-worklog-group="1"][data-live-segment-seq="${CSS.escape(segmentSeq)}"]`);
-    }
-    if(!group&&burstId){
-      group=inner.querySelector(`.tool-worklog-group[data-agent-activity-group="1"][data-tool-worklog-group="1"][data-activity-burst-id="${CSS.escape(burstId)}"],.tool-call-group[data-agent-activity-group="1"][data-tool-worklog-group="1"][data-activity-burst-id="${CSS.escape(burstId)}"]`);
-    }
-    if(!group&&activityKey){
-      group=inner.querySelector(`.tool-worklog-group[data-tool-worklog-key="${CSS.escape(activityKey)}"],.tool-call-group[data-tool-worklog-key="${CSS.escape(activityKey)}"]`);
-    }
-    if(!group&&!activityKey){
-      group=inner.querySelector('.tool-worklog-group[data-agent-activity-group="1"][data-tool-worklog-group="1"],.tool-call-group[data-agent-activity-group="1"][data-tool-worklog-group="1"],.tool-call-group[data-agent-activity-group="1"]:not([data-run-activity-group="1"])');
-    }
-  }
-  if(!group && !activityKey && segmentSeq==="" && burstId){
-    const candidates=live
-      ? Array.from(inner.querySelectorAll('.tool-worklog-group[data-live-tool-worklog-group="1"],.tool-call-group[data-live-tool-worklog-group="1"],.tool-call-group[data-live-tool-call-group="1"]'))
-      : Array.from(inner.querySelectorAll('.tool-worklog-group[data-agent-activity-group="1"],.tool-call-group[data-agent-activity-group="1"]:not([data-run-activity-group="1"])'));
-    group=candidates.filter(el=>el.isConnected!==false).pop() || null;
-  }
+  const selector=live?'.tool-call-group[data-live-tool-call-group="1"][data-live-activity-current="1"]':'.tool-call-group[data-agent-activity-group="1"]';
+  let group=inner.querySelector(selector);
   if(!group){
     group=document.createElement('div');
     let collapsed=opts.collapsed!==false;
-    if(window._worklogDetailsExpandedByDefault===true) collapsed=false;
     const savedState=_readActivityDisclosureState(activityKey);
     // Restore the user's explicit expand intent when recreating the live
     // activity group within the same turn (#1298), then let persisted chat/turn
-    // state win across session switches and reloads. Saved closed-state should
-    // override the default-expanded preference for settled groups the user has
-    // explicitly collapsed.
+    // state win across session switches and reloads.
     if(live && _liveActivityUserExpanded === true) collapsed=false;
     else if(live && _liveActivityUserExpanded === false) collapsed=true;
-    if(live && savedState==='open') collapsed=false;
-    else if(live && savedState==='closed') collapsed=true;
-    group.className='agent-activity-group tool-worklog-group activity'+(collapsed?' tool-call-group-collapsed':'');
+    if(savedState==='open') collapsed=false;
+    else if(savedState==='closed') collapsed=true;
+    group.className='tool-call-group agent-activity-group'+(collapsed?' tool-call-group-collapsed':'');
     group.setAttribute('data-tool-call-group','1');
     group.setAttribute('data-agent-activity-group','1');
-    group.setAttribute('data-tool-worklog-group','1');
-    group.setAttribute('data-tool-worklog-key',activityKey||'');
     if(activityKey) group.setAttribute('data-activity-disclosure-key',activityKey);
     if(live){
-      group.setAttribute('data-live-tool-worklog-group','1');
       group.setAttribute('data-live-tool-call-group','1');
       group.setAttribute('data-live-activity-current','1');
     }
-    if(burstId) group.setAttribute('data-activity-burst-id',burstId);
-    if(segmentSeq) group.setAttribute('data-live-segment-seq',segmentSeq);
-    group.classList.toggle('open',!collapsed);
-    group.innerHTML=`<button type="button" class="tool-call-group-summary tool-worklog-summary activity-summary" aria-expanded="${collapsed?'false':'true'}" onclick="_toggleActivityGroup(this)"><span class="as-dot"></span><span class="tool-call-group-label tool-worklog-label as-text">Running</span><span class="tool-call-group-duration"></span><span class="tool-call-group-chevron as-caret">${li('chevron-right',12)}</span></button><div class="tool-call-group-body tool-worklog-body activity-body"><div class="worklog"><div class="tool-worklog-list"></div></div></div>`;
+    group.innerHTML=`<button type="button" class="tool-call-group-summary" aria-expanded="${collapsed?'false':'true'}" onclick="_toggleActivityGroup(this)"><span class="tool-call-group-chevron">${li('chevron-right',12)}</span><span class="tool-call-group-label">Activity</span><span class="tool-call-group-duration"></span></button><div class="tool-call-group-body"></div>`;
     const anchor=opts.anchor||null;
-    if(anchor&&anchor.parentElement===inner){
-      if(opts.beforeAnchor) inner.insertBefore(group, anchor);
-      else anchor.insertAdjacentElement('afterend', group);
-    }
+    if(anchor&&anchor.parentElement===inner) anchor.insertAdjacentElement('afterend', group);
     else inner.appendChild(group);
   }else if(activityKey&&!group.getAttribute('data-activity-disclosure-key')){
     group.setAttribute('data-activity-disclosure-key',activityKey);
   }
-  if(burstId&&!group.getAttribute('data-activity-burst-id')) group.setAttribute('data-activity-burst-id',burstId);
-  if(segmentSeq&&!group.getAttribute('data-live-segment-seq')) group.setAttribute('data-live-segment-seq',segmentSeq);
-  if(!group.getAttribute('data-tool-worklog-key')&&activityKey) group.setAttribute('data-tool-worklog-key',activityKey);
-  if(opts.turnDuration!==undefined&&opts.turnDuration!==null) group.setAttribute('data-turn-duration',String(opts.turnDuration));
-  if(opts.turnStartedAt!==undefined&&opts.turnStartedAt!==null) group.setAttribute('data-turn-started-at',String(opts.turnStartedAt));
-  const anchor=opts.anchor||null;
-  if(anchor&&anchor.parentElement===inner&&group.parentElement===inner){
-    if(opts.beforeAnchor){
-      if(group.nextElementSibling!==anchor) inner.insertBefore(group,anchor);
-    }else if(group.previousElementSibling!==anchor){
-      anchor.insertAdjacentElement('afterend',group);
-    }
-  }
-  if(anchor&&opts.syncAnchorReason!==false) _syncWorklogReasonFromAnchor(group, anchor);
+  if(live) _setActivityElapsedStartedAt(group);
   _syncToolCallGroupSummary(group);
+  if(live) _startActivityElapsedTimer(group);
   return group;
-}
-function normalizeLiveActivityGroupPlacement(turn){
-  const blocks=_assistantTurnBlocks(turn);
-  if(!blocks) return;
-  const groups=Array.from(
-    blocks.querySelectorAll('.tool-worklog-group[data-live-tool-worklog-group="1"],.tool-call-group[data-live-tool-worklog-group="1"],.tool-call-group[data-live-tool-call-group="1"]')
-  );
-  groups.sort((a,b)=>{
-    const as=Number(a.getAttribute('data-live-segment-seq'));
-    const bs=Number(b.getAttribute('data-live-segment-seq'));
-    if(Number.isFinite(as)&&Number.isFinite(bs)&&as!==bs) return as-bs;
-    const av=Number(a.getAttribute('data-activity-burst-id'));
-    const bv=Number(b.getAttribute('data-activity-burst-id'));
-    if(Number.isFinite(av)&&Number.isFinite(bv)&&av!==bv) return av-bv;
-    return 0;
-  });
-  for(const group of groups){
-    const burstId=group.getAttribute('data-activity-burst-id')||'';
-    const segmentSeq=group.getAttribute('data-live-segment-seq')||'';
-    const anchor=segmentSeq
-      ? _findLiveAssistantAnchorForSegment(blocks, segmentSeq)
-      : burstId
-      ? _findLatestVisibleLiveAssistantByBurst(blocks, burstId)
-      : _findLatestVisibleLiveAssistant(blocks);
-    if(!anchor) continue;
-    if(anchor&&group.previousElementSibling!==anchor) anchor.insertAdjacentElement('afterend',group);
-    _syncWorklogReasonFromAnchor(group, anchor);
-  }
-}
-function ensureRunActivityGroup(inner, opts){
-  opts=opts||{};
-  if(!inner) return null;
-  let group=inner.querySelector('.tool-call-group[data-run-activity-group="1"]');
-  if(!group){
-    group=document.createElement('div');
-    const collapsed=opts.collapsed!==false;
-    group.className='tool-call-group agent-activity-group run-activity-group'+(collapsed?' tool-call-group-collapsed':' open');
-    group.setAttribute('data-tool-call-group','1');
-    group.setAttribute('data-agent-activity-group','1');
-    group.setAttribute('data-run-activity-group','1');
-    group.innerHTML=`<button type="button" class="tool-call-group-summary" aria-expanded="${collapsed?'false':'true'}" onclick="_toggleActivityGroup(this)"><span class="tool-call-group-chevron">${li('chevron-right',12)}</span><span class="tool-call-group-label">Running</span><span class="tool-call-group-duration"></span></button><div class="tool-call-group-body"></div>`;
-    if(inner.firstChild) inner.insertBefore(group, inner.firstChild);
-    else inner.appendChild(group);
-  }
-  if(opts.turnDuration!==undefined&&opts.turnDuration!==null) group.setAttribute('data-turn-duration',String(opts.turnDuration));
-  if(opts.turnStartedAt!==undefined&&opts.turnStartedAt!==null) group.setAttribute('data-turn-started-at',String(opts.turnStartedAt));
-  _setActivityElapsedStartedAt(group);
-  _ensureLiveActivityBaseline(group);
-  _syncToolCallGroupSummary(group);
-  if(opts.live!==false) _startActivityElapsedTimer(group);
-  return group;
-}
-// ── LiveFooter timer (module-level singleton) ──────────────────────────────
-const _liveRunStatusTimers={};  // keyed by sessionId, max 1 active
-let _liveRunStatusTokens=null;
-let _liveRunStatusSessionId=null;
-function _formatRunElapsed(seconds){
-  const n=Number(seconds);
-  if(!Number.isFinite(n)||n<0)return'00:00';
-  const total=Math.max(0,Math.floor(n));
-  if(total>=3600){
-    const h=Math.floor(total/3600);
-    const m=Math.floor((total%3600)/60);
-    return h+'h '+String(m).padStart(2,'0')+'m';
-  }
-  const m=Math.floor(total/60);
-  const s=total%60;
-  return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
-}
-function _moveLiveRunStatusToTurnEnd(el){
-  el=el||$('liveRunStatus');
-  if(!el) return null;
-  const turn=$('liveAssistantTurn');
-  const blocks=_assistantTurnBlocks(turn);
-  if(blocks&&el.parentElement===blocks&&blocks.lastElementChild!==el) blocks.appendChild(el);
-  return el;
-}
-function placeLiveRunStatusHost(){
-  let el=$('liveRunStatus');
-  if(!el){
-    el=document.createElement('div');
-    el.id='liveRunStatus';
-    el.hidden=true;
-  }
-  let turn=$('liveAssistantTurn');
-  if(!turn){
-    turn=_createAssistantTurn();
-    turn.id='liveAssistantTurn';
-    if(S.session) turn.dataset.sessionId=S.session.session_id;
-    const inner=$('msgInner');
-    if(inner) inner.appendChild(turn);
-  }
-  const blocks=_assistantTurnBlocks(turn);
-  if(blocks&&el.parentElement!==blocks) blocks.appendChild(el);
-  el.className='live-run-status live-footer';
-  return _moveLiveRunStatusToTurnEnd(el);
-}
-function showLiveRunStatus(sid,opts){
-  const el=placeLiveRunStatusHost();
-  if(!el)return;
-  _liveRunStatusSessionId=sid;
-  const startedAt=opts&&opts.startedAt||null;
-  _liveRunStatusTokens=opts&&opts.tokens||null;
-  el.hidden=false;
-  _renderLiveRunStatusContent(el,startedAt);
-  _startLiveRunStatusTimer(sid,startedAt);
-}
-function _renderLiveRunStatusContent(el,startedAt){
-  if(!el)return;
-  const now=Date.now()/1000;
-  const elapsed=startedAt?Math.max(0,now-startedAt):0;
-  const timeStr=_formatRunElapsed(elapsed);
-  const tokens=_liveRunStatusTokens;
-  el.innerHTML=`<span class="live-run-status-dot tool-card-running-dot"></span><span class="live-run-status-text lf-time">${timeStr}</span>${tokens?`<span class="lf-sep">·</span><span class="lf-tokens">${_fmtTokens(tokens)} tokens</span>`:''}<span class="lf-sep">·</span><span class="lf-status">Running</span>`;
-}
-function updateLiveRunStatus(opts){
-  if(opts&&opts.tokens!==undefined)_liveRunStatusTokens=opts.tokens;
-  const el=$('liveRunStatus');
-  if(el&&!el.hidden){
-    _moveLiveRunStatusToTurnEnd(el);
-    const timer=_liveRunStatusTimers[_liveRunStatusSessionId];
-    const startedAt=timer&&timer.startedAt||null;
-    _renderLiveRunStatusContent(el,startedAt);
-  }
-}
-function _syncLiveRunStatusAfterRender(){
-  const sid=S.session&&S.session.session_id;
-  if(!sid||!S.activeStreamId||!S.busy) return;
-  const timer=_liveRunStatusTimers[sid];
-  const startedAt=(timer&&timer.startedAt)||((S.session&&S.session.pending_started_at)||Date.now()/1000);
-  const el=$('liveRunStatus');
-  if(el&&el.isConnected&&!el.hidden){
-    _moveLiveRunStatusToTurnEnd(el);
-    _renderLiveRunStatusContent(el,startedAt);
-    return;
-  }
-  showLiveRunStatus(sid,{startedAt,tokens:_liveRunStatusTokens});
-}
-function hideLiveRunStatus(sid){
-  const el=$('liveRunStatus');
-  if(el){el.hidden=true;el.innerHTML='';}
-  _clearLiveRunStatusTimer(sid||_liveRunStatusSessionId);
-  _liveRunStatusTokens=null;
-  _liveRunStatusSessionId=null;
-}
-function _startLiveRunStatusTimer(sid,startedAt){
-  if(!sid)return;
-  _clearLiveRunStatusTimer(sid);
-  _liveRunStatusTimers[sid]={startedAt,interval:setInterval(()=>{
-    const el=$('liveRunStatus');
-    if(!el||el.hidden){_clearLiveRunStatusTimer(sid);return;}
-    if(_liveRunStatusSessionId!==sid)return;
-    _renderLiveRunStatusContent(el,startedAt);
-  },1000)};
-}
-function _clearLiveRunStatusTimer(sid){
-  const t=_liveRunStatusTimers[sid];
-  if(t){clearInterval(t.interval);delete _liveRunStatusTimers[sid];}
-}
-function ensureRunActivityForCurrentTurn(){
-  // Phase C: disabled — top live run Activity card removed
-  return null;
-  const turn=$('liveAssistantTurn');
-  const blocks=_assistantTurnBlocks(turn);
-  return ensureRunActivityGroup(blocks,{live:true,collapsed:true});
 }
 function closeCurrentLiveActivityGroup(){
   const turn=$('liveAssistantTurn');
   if(!turn) return;
-  turn.querySelectorAll('.tool-worklog-group[data-live-tool-call-group="1"][data-live-activity-current="1"],.tool-call-group[data-live-tool-call-group="1"][data-live-activity-current="1"]').forEach(group=>{
+  turn.querySelectorAll('.tool-call-group[data-live-tool-call-group="1"][data-live-activity-current="1"]').forEach(group=>{
     group.removeAttribute('data-live-activity-current');
   });
 }
@@ -7144,22 +5241,10 @@ function isCompressionUiRunning(){
   const lock=_compressionSessionLock();
   return !!((state&&state.phase==='running') || (lock && S.session && lock===S.session.session_id));
 }
-// Restore the composer placeholder saved when auto-compaction started. Safe to
-// call whenever compression leaves the running state, from any path (clear,
-// non-running setCompressionUi, or a direct window._compressionUi=null in the
-// SSE handler) — it no-ops when nothing was saved. (#3512)
-function _restoreCompressionPlaceholder(){
-  const _input=$('msg');
-  if(_input&&typeof _compressionPlaceholderSaved==='string'){
-    _input.placeholder=_compressionPlaceholderSaved;
-  }
-  _compressionPlaceholderSaved=null;
-}
 function clearCompressionUi(){
   window._compressionUi=null;
   _clearCompressionElapsedTimer();
   _setCompressionSessionLock(null);
-  _restoreCompressionPlaceholder();
   renderCompressionUi();
 }
 function setCompressionUi(state){
@@ -7173,19 +5258,8 @@ function setCompressionUi(state){
   }
   window._compressionUi=nextState;
   if(nextState.sessionId) _setCompressionSessionLock(nextState.sessionId);
-  if(nextState.automatic&&nextState.phase==='running'){
-    _startCompressionElapsedTimer();
-    const _input=$('msg');
-    if(_input&&_compressionPlaceholderSaved===null){
-      _compressionPlaceholderSaved=_input.placeholder;
-      _input.placeholder=typeof t==='function'?t('composer_compression_will_queue')||'Type a message — it will queue and send after compression':'Type a message — it will queue and send after compression';
-    }
-  } else {
-    _clearCompressionElapsedTimer();
-    // Leaving the running state (e.g. setCompressionUi(done)) must restore the
-    // placeholder too — not only clearCompressionUi(). (#3512 leak fix)
-    _restoreCompressionPlaceholder();
-  }
+  if(nextState.automatic&&nextState.phase==='running') _startCompressionElapsedTimer();
+  else _clearCompressionElapsedTimer();
   renderCompressionUi();
 }
 function _compressionCardsHtml(state){
@@ -7252,47 +5326,47 @@ function _compressionCardsHtml(state){
     ${referenceHtml}`;
 }
 function _autoCompressionBaseDetail(state){
+  const fallback='Context auto-compressed to continue the conversation';
   const running=state&&state.phase==='running';
-  if(running)return 'Compressing context';
-  if(state&&state.phase==='done')return 'Context auto-compressed';
-  return '';
+  return running
+    ? (String(state.message||'Auto-compressing context...').trim()||'Auto-compressing context...')
+    : (String(state&&state.message||fallback).trim()||fallback);
 }
 function _autoCompressionPreviewText(state){
+  const copy=_engineAwareCompressionCopy(String(state&&state.engine||_compressionEngineForSession()).toLowerCase(), String(state&&state.mode||_compressionModeForSession()).toLowerCase());
   const running=state&&state.phase==='running';
-  if(running)return 'Compressing context';
-  if(state&&state.phase==='done')return 'Context auto-compressed';
-  return '';
+  const detail=_autoCompressionBaseDetail(state);
+  if(!running) return (String(state&&state.summary?.headline||copy.preview||detail).trim()||detail);
+  const elapsedLabel=_compressionElapsedLabel(state);
+  return [detail, elapsedLabel].filter(Boolean).join(' · ');
 }
 function _autoCompressionDetailText(state){
   const running=state&&state.phase==='running';
-  if(running)return '';
-  return '';
+  const base=_autoCompressionBaseDetail(state);
+  const elapsedLabel=running?_compressionElapsedLabel(state):'';
+  if(running)return elapsedLabel?`Elapsed: ${elapsedLabel}`:base;
+  const continuation=String(state&&state.continuationSessionId||'').trim();
+  const handoff=continuation?`Continued in compressed session: ${continuation}`:'';
+  return [base,handoff].filter(Boolean).join('\n');
 }
 function _autoCompressionCardsHtml(state){
+  const copy=_engineAwareCompressionCopy(String(state&&state.engine||_compressionEngineForSession()).toLowerCase(), String(state&&state.mode||_compressionModeForSession()).toLowerCase());
+  const running=state&&state.phase==='running';
   const preview=_autoCompressionPreviewText(state);
-  const done=state&&state.phase==='done';
+  const cardDetail=_autoCompressionDetailText(state);
   return `
-    <div class="tool-card-row compression-card-row auto-compression-divider-row" data-compression-card="1">
-      <div class="auto-compression-divider${done?' auto-compression-divider-done':''}" aria-label="${esc(preview)}">
-        <span class="auto-compression-divider-line"></span>
-        <span class="auto-compression-divider-label">${done?li('file-text',13):''}${esc(preview)}</span>
-        <span class="auto-compression-divider-line"></span>
-      </div>
+    <div class="tool-card-row compression-card-row" data-compression-card="1">
+      ${_compressionStatusCardHtml({
+        statusLabel: (String(state&&state.engine||'').toLowerCase()==='lcm'||String(state&&state.mode||'').toLowerCase()==='lossless_retrieval')?copy.label:t('auto_compress_label'),
+        previewText: preview,
+        detail: cardDetail,
+        icon: running ? '<span class="tool-card-running-dot"></span>' : li('check',13),
+        open: running,
+        variantClass: running
+          ? 'tool-card-compress-running tool-card-compress-auto'
+          : 'tool-card-compress-complete tool-card-compress-auto',
+      })}
     </div>`;
-}
-function _autoCompressionWorklogNode(state){
-  const row=document.createElement('div');
-  row.className='tool-card-row compression-card-row auto-compression-divider-row';
-  row.setAttribute('data-compression-card','1');
-  const label=_autoCompressionPreviewText(state);
-  const done=state&&state.phase==='done';
-  row.innerHTML=`
-    <div class="auto-compression-divider${done?' auto-compression-divider-done':''}" aria-label="${esc(label)}">
-      <span class="auto-compression-divider-line"></span>
-      <span class="auto-compression-divider-label">${done?li('file-text',13):''}${esc(label)}</span>
-      <span class="auto-compression-divider-line"></span>
-    </div>`;
-  return row;
 }
 function _compressionCardsNode(state){
   const wrap=document.createElement('div');
@@ -7302,7 +5376,6 @@ function _compressionCardsNode(state){
 }
 function appendLiveCompressionCard(state){
   if(!S.session||!S.activeStreamId||!state) return false;
-  const scrollSnapshot=_captureMessageScrollSnapshot();
   let turn=$('liveAssistantTurn');
   if(!turn){
     turn=_createAssistantTurn();
@@ -7313,37 +5386,6 @@ function appendLiveCompressionCard(state){
   const inner=_assistantTurnBlocks(turn);
   if(!inner) return false;
   closeCurrentLiveActivityGroup();
-  if(state.automatic){
-    const group=ensureLiveWorklogContainer(inner,{activityKey:_activityKeyForLiveTurn()});
-    const list=_toolWorklogListEl(group);
-    if(!group||!list) return false;
-    const node=_autoCompressionWorklogNode(state);
-    node.setAttribute('data-live-compression-card','1');
-    node.setAttribute('data-compression-phase',String(state.phase||''));
-    if(state.phase==='running'){
-      const started=_compressionElapsedStartedAt(state)||Date.now()/1000;
-      node.setAttribute('data-compression-started-at',String(started));
-      node.setAttribute('data-compression-message',String(state.message||'Compressing context'));
-      _startCompressionElapsedTimer();
-    } else {
-      node.removeAttribute('data-compression-started-at');
-      node.removeAttribute('data-compression-message');
-      const _activeCompState = _compressionStateForCurrentSession();
-      if (!_activeCompState || !_activeCompState.automatic || _activeCompState.phase !== 'running') {
-        _clearCompressionElapsedTimer();
-      }
-    }
-    const existingRunning=group.querySelector('[data-live-compression-card="1"][data-compression-started-at]');
-    const existingDone=Array.from(group.querySelectorAll('[data-live-compression-card="1"][data-compression-phase="done"]')).pop();
-    const existing=state.phase==='running'?existingRunning:(existingRunning||existingDone);
-    if(existing) existing.replaceWith(node);
-    else list.appendChild(node);
-    _syncToolCallGroupSummary(group);
-    _moveLiveRunStatusToTurnEnd();
-    _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-    if(typeof scrollIfPinned==='function') scrollIfPinned();
-    return true;
-  }
   const node=_compressionCardsNode(state);
   if(!node) return false;
   node.setAttribute('data-live-compression-card','1');
@@ -7352,24 +5394,10 @@ function appendLiveCompressionCard(state){
     node.setAttribute('data-compression-started-at',String(started));
     node.setAttribute('data-compression-message',String(state.message||'Auto-compressing context...'));
     _startCompressionElapsedTimer();
-  } else {
-    // Completion or error: clear the elapsed-timer attributes so the
-    // interval reader (_compressionLiveCardState) doesn't keep treating
-    // the replaced card as a running compression (#2973).
-    node.removeAttribute('data-compression-started-at');
-    node.removeAttribute('data-compression-message');
-    // Only clear the global timer when the *active* session has no running
-    // compression.  An SSE completion for a background session must not
-    // kill the timer that's driving the current session's display.
-    const _activeCompState = _compressionStateForCurrentSession();
-    if (!_activeCompState || !_activeCompState.automatic || _activeCompState.phase !== 'running') {
-      _clearCompressionElapsedTimer();
-    }
   }
   const existing=inner.querySelector('[data-live-compression-card="1"]');
   if(existing) existing.replaceWith(node);
   else inner.appendChild(node);
-  _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
   if(typeof scrollIfPinned==='function') scrollIfPinned();
   return true;
 }
@@ -7418,10 +5446,7 @@ function _collectHandoffSummaryStates(messages){
 function _isContextCompactionMessage(m){
   if(!m||!m.role||m.role==='tool') return false;
   const text=msgContent(m)||String(m.content||'');
-  return _isContextCompactionText(text);
-}
-function _isContextCompactionText(text){
-  return /^\s*\[context compaction/i.test(String(text||'')) || /^\s*context compaction/i.test(String(text||''));
+  return /^\s*\[context compaction/i.test(text) || /^\s*context compaction/i.test(text);
 }
 function _isPreservedCompressionTaskListMarkerText(text){
   return /^\s*\[your active task list was preserved across context compression\]/i.test(String(text||''));
@@ -7498,9 +5523,6 @@ function _latestCompressionReferenceMessage(messages, summaryText=''){
     if(contentNorm.includes(summaryNorm)) return {message:m, rawIdx:i};
   }
   return {message:null, rawIdx:-1};
-}
-function _shouldShowSettledCompressionReference(referenceText){
-  return !!String(referenceText||'').trim() && !_isContextCompactionText(referenceText);
 }
 function _compressionReferenceCardHtml(text, open=false){
   const copy=_engineAwareCompressionCopy();
@@ -7642,7 +5664,7 @@ function _handoffStateForCurrentSession(){
 }
 function clearHandoffUi(){
   window._handoffUi=null;
-  _renderMessagesWithScrollSnapshot();
+  renderMessages();
 }
 function setHandoffUi(state){
   if(!state){
@@ -7650,7 +5672,7 @@ function setHandoffUi(state){
     return;
   }
   window._handoffUi={...state};
-  _renderMessagesWithScrollSnapshot();
+  renderMessages();
 }
 function _handoffCardsHtml(state){
   if(!state) return '';
@@ -7721,7 +5743,6 @@ let _sessionHtmlCacheSid=null; // session_id currently rendered in the DOM
 function clearMessageRenderCache(){
   _sessionHtmlCache.clear();
   _sessionHtmlCacheSid=null;
-  clearVisibleMessageRowCache();
 }
 
 function _messageRenderCacheSignature(){
@@ -7809,7 +5830,7 @@ function _cliLooksLikePatchDiff(text){
 function _cliToolResultSnippet(raw){
   const fullText=_cliToolResultText(raw);
   if(_cliLooksLikePatchDiff(fullText)) return _clipCliToolSnippet(fullText);
-  return String(fullText||'').slice(0,4000);
+  return String(fullText||'').slice(0,200);
 }
 
 function _prefixedCliDiffLines(prefix, value){
@@ -7880,47 +5901,10 @@ function _cliToolCardHasDiffSnippet(resultSnippet, patchSnippet){
   return !!patchSnippet || _cliLooksLikePatchDiff(resultSnippet);
 }
 
-function _assistantToolAnchorIdxForMessage(messages, rawIdx){
-  const list=Array.isArray(messages)?messages:[];
-  const current=list[rawIdx];
-  if(_assistantMessageHasVisibleContent(current)) return rawIdx;
-  if(_assistantReasoningPayloadText(current)) return rawIdx;
-  for(let idx=rawIdx-1;idx>=0;idx--){
-    if(_assistantMessageHasVisibleContent(list[idx])) return idx;
-  }
-  return rawIdx;
-}
-function _toolArgsSnapshot(args, limit){
-  if(!args||typeof args!=='object'||Array.isArray(args)) return {};
-  const max=Math.max(1,Number(limit)||6);
-  const priority=[
-    'query','search_query','searchQuery','pattern','q','keyword','keywords','term',
-    'url','uri','command','cmd','path','file','file_path','filename','file_glob',
-    'glob','offset','limit',
-  ];
-  const keys=[
-    ...priority.filter(k=>Object.prototype.hasOwnProperty.call(args,k)),
-    ...Object.keys(args).filter(k=>!priority.includes(k)),
-  ].slice(0,max);
-  const out={};
-  keys.forEach(k=>{
-    const v=String(args[k]);
-    out[k]=v.slice(0,120)+(v.length>120?'...':'');
-  });
-  return out;
-}
-
 function _captureMessageScrollSnapshot(){
   const el=$('messages');
   if(!el) return null;
-  const bottom=Math.max(0,el.scrollHeight-el.scrollTop-el.clientHeight);
-  return {
-    top:el.scrollTop,
-    bottom,
-    scrollHeight:el.scrollHeight,
-    pinned:_shouldFollowMessagesOnDomReplace(),
-    userUnpinned:_messageUserUnpinned,
-  };
+  return {top:el.scrollTop};
 }
 function _restoreMessageScrollSnapshot(snapshot){
   const el=$('messages');
@@ -7928,36 +5912,8 @@ function _restoreMessageScrollSnapshot(snapshot){
   const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
   _programmaticScroll=true;
   el.scrollTop=Math.max(0,Math.min(Number(snapshot.top)||0,maxTop));
-  // Sync _lastScrollTop after programmatic restore so sticky-unpin does not false-trigger (#1731).
   _lastScrollTop=el.scrollTop;
   requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
-}
-function _restoreMessageScrollSnapshotSameFrame(snapshot){
-  const el=$('messages');
-  if(!el||!snapshot) return;
-  const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
-  const bottom=Number(snapshot.bottom);
-  const target=(snapshot.pinned===true&&Number.isFinite(bottom))
-    ? maxTop-Math.max(0,bottom)
-    : Number(snapshot.top)||0;
-  _programmaticScroll=true;
-  el.scrollTop=Math.max(0,Math.min(target,maxTop));
-  _lastScrollTop=el.scrollTop;
-  if(snapshot.pinned===true){
-    _messageUserUnpinned=false;
-    _scrollPinned=true;
-    _nearBottomCount=2;
-  }else if(snapshot.userUnpinned===true){
-    _messageUserUnpinned=true;
-    _scrollPinned=false;
-    _nearBottomCount=0;
-  }
-  requestAnimationFrame(()=>{ setTimeout(()=>{_programmaticScroll=false;},0); });
-}
-function _renderMessagesWithScrollSnapshot(options){
-  const scrollSnapshot=_captureMessageScrollSnapshot();
-  renderMessages({...(options||{}),preserveScroll:true});
-  _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
 }
 function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
   // Terminal stream renders can happen after S.activeStreamId is cleared.
@@ -7965,17 +5921,8 @@ function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
   // pinned users stay at bottom; users who manually scrolled up get their
   // pre-render scrollTop restored after the DOM replacement.
   if(preserveScroll){
-    // Keep master's follow heuristic for pinned / still-near-bottom users:
-    // _followMessagesAfterDomReplace() does a FORCED scrollToBottom() (synchronous
-    // bottom write + forced settle), so the final settled response can't leave a
-    // pinned reader a few lines short. Only genuinely-scrolled-up (unpinned, not
-    // near bottom) users fall through to keep their position and get the
-    // new-message cue. (Using scrollIfPinned() here instead would skip the forced
-    // write unless distance>500 and let the DOM-rebuild scroll event cancel the
-    // delayed settles — Codex CORE catch on #3631.)
-    if(_followMessagesAfterDomReplace()) return;
-    _restoreMessageScrollSnapshot(scrollSnapshot);
-    _maybeShowNewMessageScrollCue(scrollSnapshot);
+    if(_scrollPinned) scrollIfPinned();
+    else _restoreMessageScrollSnapshot(scrollSnapshot);
     return;
   }
   if(S.activeStreamId){
@@ -7991,13 +5938,9 @@ function renderMessages(options){
   const inner=$('msgInner');
   const sid=S.session?S.session.session_id:null;
   const msgCount=S.messages.length;
-  // During session switch, S.messages is intentionally cleared while the full
-  // message fetch is still in flight. Other async updates can still call
-  // renderMessages() in this window. Keep the existing loading placeholder.
-  if(_loadingSessionId===sid&&msgCount===0&&inner) return;
   if(sid!==_messageRenderWindowSid) _resetMessageRenderWindow(sid);
   const renderWindowSize=_currentMessageRenderWindowSize();
-  let cachedRenderSignature=null;
+  const renderSignature=_messageRenderCacheSignature();
   const hasTransientTranscriptUi=!!(
     (window._compressionUi&&(!window._compressionUi.sessionId||window._compressionUi.sessionId===sid)) ||
     (window._handoffUi&&(!window._handoffUi.sessionId||window._handoffUi.sessionId===sid))
@@ -8012,8 +5955,6 @@ function renderMessages(options){
   // cross-channel handoff summaries; otherwise the cached transcript returns
   // before those cards can be inserted.
   if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){
-    const renderSignature=_messageRenderCacheSignature();
-    cachedRenderSignature=renderSignature;
     const cached=_sessionHtmlCache.get(sid);
     if(cached&&cached.msgCount===msgCount&&cached.renderWindowSize===renderWindowSize&&cached.signature===renderSignature){
       inner.innerHTML=cached.html;
@@ -8028,16 +5969,7 @@ function renderMessages(options){
     }
   }
 
-  const compressionState=(()=>{
-    let compressionState=_compressionStateForCurrentSession();
-    if(!S.busy && compressionState && compressionState.automatic){
-      window._compressionUi=null;
-      _clearCompressionElapsedTimer();
-      _setCompressionSessionLock(null);
-      compressionState=null;
-    }
-    return compressionState;
-  })();
+  const compressionState=_compressionStateForCurrentSession();
   if(window._compressionUi && !compressionState) clearCompressionUi();
   const handoffState=_handoffStateForCurrentSession();
   if(window._handoffUi && !handoffState) window._handoffUi=null;
@@ -8055,36 +5987,14 @@ function renderMessages(options){
     if(!m||!m.role||m.role==='tool')return false;
     if(_isContextCompactionMessage(m)) return false;
     if(_isPreservedCompressionTaskListMessage(m)) return false;
-    if(_isRecoveryControlMessage(m)) return false;
     if(m.role==='assistant'){
       const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
       const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-      const hasPartialTc=Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0;
-      if(hasTc||hasTu||hasPartialTc||_messageHasReasoningPayload(m)) return true;
-      if(_assistantMessageHasVisibleContent(m)) return true;
-      const visibleText=_isAssistantEmptyPlaceholderContent(m,msgContent(m))?'':msgContent(m);
-      return m._statusCard||visibleText||m.attachments?.length;
+      if(hasTc||hasTu||_messageHasReasoningPayload(m)) return true;
     }
     return m._statusCard||msgContent(m)||m.attachments?.length;
   });
   $('emptyState').style.display=(vis.length||preservedCompressionTaskMessages.length)?'none':'';
-  // Mid-stream flicker fix (#3877): when a renderMessages() rebuild is reached
-  // while THIS session is actively streaming (e.g. the clarify-response echo at
-  // messages.js, or a CLI-import refresh), the `inner.innerHTML=''` below detaches
-  // the live `#liveAssistantTurn` node — and the smd parser keeps writing into
-  // that now-orphaned node, so the streamed text vanishes until the next stream
-  // event rebuilds the turn ("disappears, then reappears"). Capture the live
-  // turn's actual DOM node (not its HTML — the parser holds a live reference into
-  // it) so it can be re-attached after the rebuild, keeping the parser target
-  // connected and the streamed text visible. Only for the streaming session's own
-  // live turn; never affects settled transcripts.
-  let _preservedLiveTurn=null;
-  if(sid&&INFLIGHT[sid]){
-    const _lt=document.getElementById('liveAssistantTurn');
-    if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
-      _preservedLiveTurn=_lt;
-    }
-  }
   inner.innerHTML='';
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
   const {message:referenceMessage, rawIdx:referenceMessageRawIdx}=_latestCompressionReferenceMessage(
@@ -8094,38 +6004,19 @@ function renderMessages(options){
   const referenceText=referenceMessage
     ? msgContent(referenceMessage)||String(referenceMessage.content||'')
     : sessionCompressionSummary;
-  const referenceNode=(!compressionState && _shouldShowSettledCompressionReference(referenceText) && (sessionCompressionAnchor!==null || sessionCompressionAnchorKey || sessionCompressionSummary))
+  const referenceNode=(!compressionState && !!referenceText && (sessionCompressionAnchor!==null || sessionCompressionAnchorKey || sessionCompressionSummary))
     ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_compressionReferenceCardHtml(referenceText,false)}${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
     : null;
   let preservedCompressionTaskCardsAttached=!!referenceNode;
-  // Cache visWithIdx so expanding the render window (Load earlier) doesn't
-  // re-scan S.messages from scratch.  Invalidate only when the message array
-  // length changes — i.e. new messages arrived or session was truncated.
-  if(!_visWithIdxCache || _visWithIdxCacheLen !== S.messages.length || _visWithIdxCacheSrc !== S.messages){
-    const rebuilt=[];
-    let ri=0;
-    for(const m of S.messages){
-      if(!m||!m.role||m.role==='tool'){ri++;continue;}
-      if(_isContextCompactionMessage(m)){ri++;continue;}
-      if(_isPreservedCompressionTaskListMessage(m)){ri++;continue;}
-      if(_isRecoveryControlMessage(m)){ri++;continue;}
-      const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
-      const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
-      const hasPartialTc=Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0;
-      const visibleText=_isAssistantEmptyPlaceholderContent(m,msgContent(m))?'':msgContent(m);
-      if(visibleText||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||hasPartialTc||_messageHasReasoningPayload(m)||_assistantMessageHasVisibleContent(m)))) rebuilt.push({m,rawIdx:ri});
-      ri++;
-    }
-    _visWithIdxCache=rebuilt;
-    _visWithIdxCacheLen=S.messages.length;
-    _visWithIdxCacheSrc=S.messages;
-  }
-  const visWithIdx=_visWithIdxCache;
+  const visWithIdx=[];
   const preservedCompressionRawIdxs=[];
   let rawIdx=0;
   for(const m of S.messages){
     if(!m||!m.role||m.role==='tool'){rawIdx++;continue;}
     if(_isPreservedCompressionTaskListMessage(m)){preservedCompressionRawIdxs.push(rawIdx);rawIdx++;continue;}
+    const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
+    const hasTu=Array.isArray(m.content)&&m.content.some(p=>p&&p.type==='tool_use');
+    if(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||_messageHasReasoningPayload(m)))) visWithIdx.push({m,rawIdx});
     rawIdx++;
   }
   // Show a top affordance when earlier transcript content exists either in
@@ -8136,10 +6027,7 @@ function renderMessages(options){
   const hiddenBeforeCount=windowStart;
   const renderVisWithIdx=visWithIdx.slice(windowStart);
   const firstRenderedRawIdx=renderVisWithIdx.length?renderVisWithIdx[0].rawIdx:Infinity;
-  const assistantTurnFinalVisibleContentByRawIdx=_assistantTurnFinalVisibleContentMap(visWithIdx);
-  const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx);
   const hasServerOlder=!!(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0);
-  const serverOlderCount=hasServerOlder&&Number.isFinite(Number(_oldestIdx))?Math.max(0,Number(_oldestIdx)):0;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   if(hiddenBeforeCount>0 || hasServerOlder){
     const indicator=document.createElement('button');
@@ -8148,9 +6036,7 @@ function renderMessages(options){
     indicator.className='load-older-indicator message-window-load-earlier';
     indicator.textContent=hiddenBeforeCount>0
       ? `Load earlier messages (${hiddenBeforeCount} hidden)`
-      : (serverOlderCount>0
-        ? `Load earlier messages (${serverOlderCount} older)`
-        : (typeof t==='function'?t('load_older_messages'):'Load earlier messages'));
+      : (typeof t==='function'?t('load_older_messages'):'Load earlier messages');
     indicator.onclick=()=>{
       if(hiddenBeforeCount>0) _showEarlierRenderedMessages();
       else if(typeof _loadOlderMessages==='function') _loadOlderMessages();
@@ -8180,78 +6066,16 @@ function renderMessages(options){
   }
   let _prevSepKey=null;
   let currentAssistantTurn=null;
-  // Only build question→assistant mapping for the visible window, not the
-  // full visWithIdx.  The jump-to-question button is only rendered for
-  // assistant messages that appear in the current render window anyway.
   const questionRawIdxByAssistantRawIdx=new Map();
-  // Seed lastQuestionRawIdx from hidden messages so the first visible
-  // assistant message still gets a valid jump target even when its
-  // corresponding user message sits just before the render window.
   let lastQuestionRawIdx=-1;
-  for(let i=0;i<windowStart;i++){
-    const role=visWithIdx[i]?.m?.role;
-    if(role==='user') lastQuestionRawIdx=visWithIdx[i].rawIdx;
-  }
-  for(const entry of renderVisWithIdx){
+  for(const entry of visWithIdx){
     const role=entry&&entry.m&&entry.m.role;
     if(role==='user') lastQuestionRawIdx=entry.rawIdx;
     else if(role==='assistant') questionRawIdxByAssistantRawIdx.set(entry.rawIdx,lastQuestionRawIdx);
   }
-  const assistantRawIdxByQuestionRawIdx=new Map();
-  for(const [aIdx,qIdx] of questionRawIdxByAssistantRawIdx){
-    if(!assistantRawIdxByQuestionRawIdx.has(qIdx)) assistantRawIdxByQuestionRawIdx.set(qIdx,aIdx);
-  }
-  // #3709 (defect B): build a per-turn combined visible-answer text so the
-  // thinking echo-strip can de-dupe a thinking-only message (whose own visible
-  // body is empty) against the answer prose carried by a SIBLING message in the
-  // same turn. A turn = the run of assistant messages between two user messages.
-  // Map every assistant rawIdx in a run to the run's combined visible text.
-  const _turnVisibleTextByRawIdx=new Map();
-  {
-    let _run=[]; let _runText=[];
-    const _flush=()=>{
-      if(_run.length){
-        const combined=_runText.join('\n\n');
-        for(const ri of _run) _turnVisibleTextByRawIdx.set(ri, combined);
-      }
-      _run=[]; _runText=[];
-    };
-    for(const entry of renderVisWithIdx){
-      const em=entry&&entry.m; const role=em&&em.role;
-      if(role==='assistant'){
-        _run.push(entry.rawIdx);
-        // Visible prose = content with any leading <think>…</think> /channel-thought
-        // block stripped (the same blocks the per-message extractor removes below).
-        let vis=typeof em.content==='string'?em.content:'';
-        vis=vis.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'')
-               .replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'')
-               .replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trim();
-        if(vis) _runText.push(vis);
-      }else{
-        _flush();
-      }
-    }
-    _flush();
-  }
-
   const assistantSegments=new Map();
   const assistantThinking=new Map();
   const userRows=new Map();
-  // Only collect tool-call assistant indices for messages that are actually
-  // rendered in the current window.  S.toolCalls can grow large in long turns,
-  // but we only need the ones whose assistant_msg_idx falls inside the visible
-  // range.
-  const toolCallAssistantIdxs=new Set();
-  if(Array.isArray(S.toolCalls)){
-    const renderedRawIdxs=new Set(renderVisWithIdx.map(e=>e.rawIdx));
-    for(const tc of S.toolCalls){
-      if(!tc) continue;
-      const idx=tc.assistant_msg_idx;
-      if(idx!==undefined && renderedRawIdxs.has(idx)){
-        toolCallAssistantIdxs.add(idx);
-      }
-    }
-  }
   // Windowed render loop replaces the legacy full loop:
   // for(let vi=0;vi<visWithIdx.length;vi++)
   for(let vi=0;vi<renderVisWithIdx.length;vi++){
@@ -8271,32 +6095,30 @@ function renderMessages(options){
     let content=m.content||'';
     let thinkingText='';
     if(Array.isArray(content)){
+      thinkingText=content.filter(p=>p&&(p.type==='thinking'||p.type==='reasoning')).map(p=>p.thinking||p.reasoning||p.text||'').join('\n');
       content=content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
     }
-    if(typeof content==='string'){
-      if(typeof window!=='undefined'&&typeof window._extractInlineThinkingFromContentForRender==='function'){
-        const split=window._extractInlineThinkingFromContentForRender(content, thinkingText);
-        thinkingText=split.reasoning||thinkingText;
-        content=split.content;
-      }else if(!thinkingText){
-        const thinkMatch=content.match(/^\s*<think>([\s\S]*?)<\/think>\s*/);
-        if(thinkMatch){
-          thinkingText=thinkMatch[1].trim();
-          content=content.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'').trimStart();
+    if(!thinkingText && (m.reasoning_content || m.reasoning)) thinkingText=m.reasoning_content || m.reasoning;
+    if(!thinkingText && typeof content==='string'){
+      const thinkMatch=content.match(/^\s*<think>([\s\S]*?)<\/think>\s*/);
+      if(thinkMatch){
+        thinkingText=thinkMatch[1].trim();
+        content=content.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'').trimStart();
+      }
+      if(!thinkingText){
+        // Historical name "gemmaMatch" refers to MiniMax <|channel>thought format.
+        const gemmaMatch=content.match(/^\s*<\|channel\|?>thought\n?([\s\S]*?)<channel\|>\s*/);
+        if(gemmaMatch){
+          thinkingText=gemmaMatch[1].trim();
+          content=content.replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'').trimStart();
         }
-        if(!thinkingText){
-          const gemmaMatch=content.match(/^\s*<\|channel\|?>thought\n?([\s\S]*?)<channel\|>\s*/);
-          if(gemmaMatch){
-            thinkingText=gemmaMatch[1].trim();
-            content=content.replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'').trimStart();
-          }
-        }
-        if(!thinkingText){
-          const gemmaTurnMatch=content.match(/^\s*<\|turn\|>thinking\n([\s\S]*?)<turn\|>\s*/);
-          if(gemmaTurnMatch){
-            thinkingText=gemmaTurnMatch[1].trim();
-            content=content.replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trimStart();
-          }
+      }
+      if(!thinkingText){
+        // Gemma 4 uses asymmetric <|turn|>thinking\n...<turn|> delimiters.
+        const gemmaTurnMatch=content.match(/^\s*<\|turn\|>thinking\n([\s\S]*?)<turn\|>\s*/);
+        if(gemmaTurnMatch){
+          thinkingText=gemmaTurnMatch[1].trim();
+          content=content.replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trimStart();
         }
       }
     }
@@ -8304,14 +6126,9 @@ function renderMessages(options){
     if(!isUser&&_isMarkerOnlyAssistantCompressionMessage(m)){
       content='**Error:** No response received after context compression. Please retry.';
     }
-    const displayContent=isUser?_stripAttachedFilesMarkerForDisplay(_stripWorkspaceDisplayPrefix(content)):content;
-    if(!isUser&&_isAssistantEmptyPlaceholderContent(m, displayContent)){
-      content='';
-    }
-    if(!isUser&&isSimplifiedToolCalling()&&!thinkingText){
-      const turnFinalVisibleContent=assistantTurnFinalVisibleContentByRawIdx.get(rawIdx)||'';
-      const turnVisibleContents=assistantTurnVisibleContentByRawIdx.get(rawIdx)||[];
-      thinkingText=_worklogReasoningTextFromMessage(m, rawIdx, toolCallAssistantIdxs, displayContent, turnFinalVisibleContent, turnVisibleContents);
+    const displayContent=isUser?_stripWorkspaceDisplayPrefix(content):content;
+    if(thinkingText&&!isUser){
+      thinkingText=_stripVisibleAssistantEchoFromThinking(thinkingText, displayContent);
     }
     const isLastAssistant=!isUser&&vi===renderVisWithIdx.length-1;
     const nextRendered=renderVisWithIdx[vi+1];
@@ -8328,7 +6145,7 @@ function renderMessages(options){
         return _renderAttachmentHtml(fname,fileUrl);
       }).join('')}</div>`;
     }
-    let bodyHtml = _getCachedRender(displayContent, isUser);
+    let bodyHtml = isUser ? _renderUserFencedBlocks(displayContent) : renderMd(_stripXmlToolCallsDisplay(String(displayContent)));
     if(!isUser&&m.provider_details){
       const summary=m.provider_details_label||'Provider details';
       bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
@@ -8348,19 +6165,23 @@ function renderMessages(options){
     const tsTitle=tsVal?(_fmtSv?_fmtSv(new Date(tsVal*1000),{}):new Date(tsVal*1000).toLocaleString()):'';
     const tsTime=_formatMessageFooterTimestamp(tsVal);
     const timeHtml = tsTime ? `<span class="msg-time" title="${esc(tsTitle)}">${tsTime}</span>` : '';
-    // #3114: show jump-to-question on every assistant message that has a
-    // resolvable question target, not just the turn-final one. Multi-step
-    // turns (tool_call -> assistant -> tool_call -> assistant) otherwise
-    // strip the button from every intermediate assistant bubble and the
-    // user loses the navigation affordance.
-    const _qJumpTarget=(!isUser&&!m._live)?questionRawIdxByAssistantRawIdx.get(rawIdx):undefined;
-    const questionJumpBtn = (_qJumpTarget!==undefined&&_qJumpTarget!==null)
-      ? _questionJumpButtonHtml(_qJumpTarget, assistantRawIdxByQuestionRawIdx.get(_qJumpTarget)??rawIdx)
+    const questionJumpBtn = (!isUser&&!m._live&&isTurnFinalAssistant)
+      ? _questionJumpButtonHtml(questionRawIdxByAssistantRawIdx.get(rawIdx))
       : '';
     const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}</span>${questionJumpBtn}</div>`;
 
     if(_isContextCompactionMessage(m)){
-      continue;
+      if(compressionState || referenceNode){
+        continue;
+      }else{
+        currentAssistantTurn=null;
+        const row=document.createElement('div');
+        const preservedForThisCard=preservedCompressionTaskCardsAttached?[]:preservedCompressionTaskMessages;
+        row.innerHTML=_contextCompactionMessageHtml(m, tsTitle, preservedForThisCard);
+        if(preservedForThisCard.length) preservedCompressionTaskCardsAttached=true;
+        inner.appendChild(row.firstElementChild);
+        continue;
+      }
     }
 
     if(isUser){
@@ -8385,13 +6206,6 @@ function renderMessages(options){
     seg.className='assistant-segment';
     seg.dataset.msgIdx=rawIdx;
     seg.dataset.rawText=String(content).trim();
-    if(m._activityBurstId!==undefined&&m._activityBurstId!==null) seg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
-    if(Number.isFinite(Number(m._liveSegmentSeq))) seg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
-    const messageBelongsInWorklog=!S.busy&&isSimplifiedToolCalling()&&_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, displayContent, {isTurnFinalAssistant});
-    if(messageBelongsInWorklog){
-      seg.classList.add('assistant-segment-worklog-source');
-      seg.setAttribute('aria-hidden','true');
-    }
     if(m._live){
       currentAssistantTurn.id='liveAssistantTurn';
       // Stamp the session id on the live turn so finalizeThinkingCard()
@@ -8402,31 +6216,8 @@ function renderMessages(options){
       seg.setAttribute('data-live-assistant','1');
     }
     if(_ERR_MSG_RE.test(String(content||'').trim())) seg.dataset.error='1';
-    // A turn whose visible content is empty but which carries a separate
-    // `reasoning` field (e.g. a run-journal-recovered anchor: empty content +
-    // reasoning + `_recovered_from_run_journal`) extracts NO inline thinkingText
-    // and would render no Thinking Card at all — collapsing to an empty hidden
-    // anchor. A session made entirely of such rows then paints blank (only date
-    // separators) — the #3875 reporter's exact case (Compact tool activity OFF,
-    // i.e. legacy mode). Surface the message's reasoning payload as the Thinking
-    // Card source for these empty-content turns so the turn is never blank.
-    //
-    // LEGACY-MODE ONLY (!isSimplifiedToolCalling()): the simplified/Worklog path
-    // already derives reasoning above (line ~8149 via
-    // _worklogReasoningTextFromMessage, which strips an exact visible-answer echo
-    // so reasoning duplicating a sibling answer is not re-shown). Repopulating the
-    // raw reasoning here would bypass that echo-strip and re-render the duplicate
-    // as a Worklog Thinking card (Codex gate catch). In legacy mode there is no
-    // Worklog folding, so the raw payload is the correct Thinking-card source.
-    // Stays OUT of the inline-content `thinkingText` extraction block (#2565) and
-    // only fires for empty-content/no-inline-thinking turns, so answer-bearing
-    // messages are unchanged.
-    if(!isUser&&!m._live&&!isSimplifiedToolCalling()&&!thinkingText&&!String(content||'').trim()&&!filesHtml&&!statusHtml){
-      const _reasoningPayload=_assistantReasoningPayloadText(m);
-      if(_reasoningPayload) thinkingText=_reasoningPayload;
-    }
     if(thinkingText&&window._showThinking!==false){
-      if(isSimplifiedToolCalling()&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
+      if(isSimplifiedToolCalling()) assistantThinking.set(rawIdx, thinkingText);
       else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
     }
     const hasVisibleBody=!!(String(content||'').trim()||filesHtml||statusHtml);
@@ -8503,7 +6294,7 @@ function renderMessages(options){
     }
     inner.appendChild(node);
   }
-  const preservedOnlyNode=(!preservedCompressionTaskCardsAttached&&(!referenceNode||compressionState)&&preservedCompressionTaskMessages.length)
+  const preservedOnlyNode=(!preservedCompressionTaskCardsAttached&&(!referenceMessage||compressionState)&&preservedCompressionTaskMessages.length)
     ? (()=>{const row=document.createElement('div');row.innerHTML=`<div class="compression-turn"><div class="compression-turn-blocks">${_preservedCompressionTaskListCardsHtml(preservedCompressionTaskMessages)}</div></div>`;return row.firstElementChild;})()
     : null;
   const preservedOnlyAnchor=preservedCompressionRawIdxs.length
@@ -8530,20 +6321,12 @@ function renderMessages(options){
   // tracking, or runs that didn't go through the normal streaming path), build
   // a display list from per-message tool_calls (OpenAI format) stored in each
   // assistant message. This covers the reload case described in issue #140.
-  const hasMessageToolMetadata=!S.busy&&Array.isArray(S.messages)&&S.messages.some(m=>
-    m&&m.role==='assistant'&&(
-      (Array.isArray(m.tool_calls)&&m.tool_calls.length>0)||
-      (Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0)||
-      (Array.isArray(m.content)&&m.content.some(p=>p&&typeof p==='object'&&p.type==='tool_use'))
-    )
-  );
-  if(!S.busy && (hasMessageToolMetadata||!S.toolCalls||!S.toolCalls.length)){
-    // Index tool outputs by tool_call_id / tool_use_id so the
+  if(!S.busy && (!S.toolCalls||!S.toolCalls.length)){
+    // Pass 1: index tool outputs by tool_call_id / tool_use_id so the
     // fallback-built cards carry their result snippet (not just the command).
     // Without this step CLI-origin sessions reload with empty tool cards.
     const resultsByTid={};
-    const fallbackToolSources=[];
-    S.messages.forEach((m,rawIdx)=>{
+    S.messages.forEach(m=>{
       if(!m) return;
       // OpenAI / Hermes CLI format: role=tool with tool_call_id
       if(m.role==='tool'){
@@ -8563,41 +6346,10 @@ function renderMessages(options){
           resultsByTid[tid]=_cliToolResultSnippet(raw);
         });
       }
-      if(m.role==='assistant'){
-        const hasTopLevelToolCalls=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
-        const hasPartialToolCalls=Array.isArray(m._partial_tool_calls)&&m._partial_tool_calls.length>0;
-        const hasContentToolUse=Array.isArray(m.content)&&m.content.some(p=>p&&typeof p==='object'&&p.type==='tool_use');
-        if(hasTopLevelToolCalls||hasContentToolUse||hasPartialToolCalls) fallbackToolSources.push({m,rawIdx});
-      }
     });
     const derived=[];
-    const liveToolMetadata=Array.isArray(S._settledLiveToolMetadata)
-      ? S._settledLiveToolMetadata
-      : (Array.isArray(S.toolCalls)?S.toolCalls:[]);
-    const liveMetadataByTid=new Map();
-    liveToolMetadata.forEach((tc,idx)=>{
-      if(!tc||typeof tc!=='object') return;
-      const tid=tc.tid||tc.id||tc.tool_call_id||tc.call_id||'';
-      if(tid&&!liveMetadataByTid.has(tid)) liveMetadataByTid.set(tid,{tc,idx});
-    });
-    const usedLiveToolMetadata=new Set();
-    const copyLiveToolMetadata=(next,name,tid)=>{
-      let matchEntry=tid?liveMetadataByTid.get(tid):null;
-      if(!matchEntry){
-        const matchIdx=liveToolMetadata.findIndex((tc,i)=>tc&&!usedLiveToolMetadata.has(i)&&(!name||tc.name===name));
-        if(matchIdx>=0) matchEntry={tc:liveToolMetadata[matchIdx],idx:matchIdx};
-      }
-      if(matchEntry){
-        usedLiveToolMetadata.add(matchEntry.idx);
-        const live=matchEntry.tc||{};
-        for(const key of ['activityBurstId','duration','started_at']){
-          if((next[key]===undefined||next[key]===null)&&live[key]!==undefined&&live[key]!==null) next[key]=live[key];
-        }
-      }
-      return next;
-    };
-    fallbackToolSources.forEach(({m,rawIdx})=>{
-      const assistantToolAnchorIdx=_assistantToolAnchorIdxForMessage(S.messages,rawIdx);
+    S.messages.forEach((m,rawIdx)=>{
+      if(m.role!=='assistant') return;
       // OpenAI format: top-level tool_calls field on the assistant message
       (m.tool_calls||[]).forEach(tc=>{
         if(!tc||typeof tc!=='object') return;
@@ -8608,43 +6360,17 @@ function renderMessages(options){
         const tid=tc.id||tc.call_id||'';
         const patchSnippet=_cliPatchSnippetFromArgs(name,args);
         const resultSnippet=resultsByTid[tid]||'';
-        let argsSnap=_toolArgsSnapshot(args);
-        derived.push(copyLiveToolMetadata({
+        let argsSnap={};
+        Object.keys(args).slice(0,4).forEach(k=>{ const v=String(args[k]); argsSnap[k]=v.slice(0,120)+(v.length>120?'...':''); });
+        derived.push({
           name,
           snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
           is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
           tid,
-          assistant_msg_idx:assistantToolAnchorIdx,
+          assistant_msg_idx:rawIdx,
           args:argsSnap,
           done:true,
-        }, name, tid));
-      });
-      // WebUI partial/live format: _partial_tool_calls snapshots survive
-      // interrupted or adapter-shaped settles even when session.tool_calls is empty.
-      const partialToolCalls=Array.isArray(m._partial_tool_calls)?m._partial_tool_calls:[];
-      partialToolCalls.forEach(tc=>{
-        if(!tc||typeof tc!=='object') return;
-        const fn=tc.function||{};
-        const name=tc.name||fn.name||'tool';
-        let args=tc.args||tc.input||{};
-        if(!args||typeof args!=='object'){
-          try{ args=JSON.parse(fn.arguments||'{}'); }catch(e){ args={}; }
-        }else if(!Object.keys(args).length&&fn.arguments){
-          try{ args=JSON.parse(fn.arguments||'{}'); }catch(e){}
-        }
-        const tid=tc.tid||tc.id||tc.tool_call_id||tc.call_id||'';
-        const patchSnippet=_cliPatchSnippetFromArgs(name,args);
-        const resultSnippet=resultsByTid[tid]||tc.snippet||tc.preview||'';
-        const argsSnap=_toolArgsSnapshot(args);
-        derived.push(copyLiveToolMetadata({
-          name,
-          snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
-          is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
-          tid,
-          assistant_msg_idx:assistantToolAnchorIdx,
-          args:argsSnap,
-          done:true,
-        }, name, tid));
+        });
       });
       // Anthropic format: tool_use blocks inside assistant content array
       if(Array.isArray(m.content)){
@@ -8655,191 +6381,103 @@ function renderMessages(options){
           const tid=p.id||'';
           const patchSnippet=_cliPatchSnippetFromArgs(name,args);
           const resultSnippet=resultsByTid[tid]||'';
-          const argsSnap=_toolArgsSnapshot(args);
-          derived.push(copyLiveToolMetadata({
+          const argsSnap={};
+          if(args && typeof args==='object'){
+            Object.keys(args).slice(0,4).forEach(k=>{ const v=String(args[k]); argsSnap[k]=v.slice(0,120)+(v.length>120?'...':''); });
+          }
+          derived.push({
             name,
             snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
             is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
             tid,
-            assistant_msg_idx:assistantToolAnchorIdx,
+            assistant_msg_idx:rawIdx,
             args:argsSnap,
             done:true,
-          }, name, tid));
-        });
-      }
-      // WebUI-internal partial tool calls captured on cancel/stop
-      // (private shape: name/args/done/preview/snippet, no OpenAI envelope).
-      if(Array.isArray(m._partial_tool_calls)){
-        m._partial_tool_calls.forEach(tc=>{
-          if(!tc||typeof tc!=='object') return;
-          const name=tc.name||'tool';
-          const args=tc.args||{};
-          const tid=tc.id||tc.call_id||tc.tool_call_id||tc.tid||'';
-          const patchSnippet=_cliPatchSnippetFromArgs(name,args);
-          const resultSnippet=_cliToolResultSnippet(tc.snippet||tc.result||tc.output||tc.preview||'');
-          const argsSnap=_toolArgsSnapshot(args,4);
-          derived.push(copyLiveToolMetadata({
-            name,
-            snippet:_cliToolCardSnippet(resultSnippet,patchSnippet),
-            is_diff:_cliToolCardHasDiffSnippet(resultSnippet,patchSnippet),
-            tid,
-            assistant_msg_idx:assistantToolAnchorIdx,
-            args:argsSnap,
-            done:true,
-          }, name, tid));
+          });
         });
       }
     });
     if(derived.length) S.toolCalls=derived;
-    if(S._settledLiveToolMetadata) S._settledLiveToolMetadata=null;
   }
-  if(!S.busy || (S.toolCalls&&S.toolCalls.length)){
-    // Rebuild settled tool/worklog/thinking nodes. The `|| (S.toolCalls.length)`
-    // arm is REQUIRED, not just `!S.busy`: when renderMessages re-runs during an
-    // active stream (e.g. switching back to an in-progress session, busy=true),
-    // the earlier innerHTML wipe removed every settled turn's worklog above the
-    // live turn. Gating purely on `!S.busy` skipped this rebuild while busy and
-    // left those prior turns' tool cards gone until the stream finished (#3401
-    // regression vs master; same content-loss-on-switch class as #3668). The
-    // `:not([data-live-thinking="1"])` / live-card guards below keep the active
-    // turn's own live nodes from being double-built.
-    inner.querySelectorAll('.tool-worklog-group:not([data-compression-card]),.tool-call-group:not([data-compression-card]),.tool-card-row:not([data-compression-card]),.agent-activity-thinking:not([data-live-thinking="1"]),.wl-reason[data-worklog-reason-source="reasoning"]').forEach(el=>el.remove());
-    const byActivity = new Map();
-    const assistantIdxs=[...assistantSegments.keys()].sort((a,b)=>a-b);
-    const _assistantAnchorForActivity=(aIdx,segmentSeq,burstId)=>{
-      if(segmentSeq){
-        for(const seg of assistantSegments.values()){
-          if(seg&&seg.getAttribute('data-live-segment-seq')===String(segmentSeq)) return seg;
-        }
-      }
-      const wantedBurst=burstId!==undefined&&burstId!==null&&String(burstId)!==''&&String(burstId)!=='0'?String(burstId):'';
-      if(wantedBurst){
-        for(const seg of assistantSegments.values()){
-          if(seg&&seg.getAttribute('data-activity-burst-id')===wantedBurst) return seg;
-        }
-      }
-      let anchorRow=assistantSegments.get(aIdx)||null;
-      if(!anchorRow&&assistantIdxs.length){
-        if(aIdx<assistantIdxs[0]) return null;
-        const fallbackIdx=[...assistantIdxs].reverse().find(idx=>idx<=aIdx);
-        anchorRow=fallbackIdx!==undefined?assistantSegments.get(fallbackIdx):assistantSegments.get(assistantIdxs[assistantIdxs.length-1]);
-      }
-      return anchorRow;
-    };
-    const _turnDurationForAnchor=(anchorRow)=>{
-      if(!anchorRow) return undefined;
-      const turn=anchorRow.closest('.assistant-turn');
-      const blocks=_assistantTurnBlocks(turn);
-      if(!blocks) return undefined;
-      let duration;
-      for(const seg of blocks.querySelectorAll('.assistant-segment')){
-        const idx=Number(seg.dataset&&seg.dataset.msgIdx);
-        const msg=Number.isFinite(idx)?S.messages[idx]:null;
-        if(msg&&msg._turnDuration!==undefined) duration=msg._turnDuration;
-      }
-      return duration;
-    };
-    const durationAssignedTurns = new Set();
-    const activityByTurn = new Map();
-    const activityOrder = [];
-    const ensureActivityBucket=(key,aIdx,segmentSeq,burstId)=>{
-      if(!byActivity.has(key)){
-        const entry={key,aIdx,segmentSeq:segmentSeq||'',burstId:burstId||'',cards:[],thinkingIdx:null,includeAnchorReason:false};
-        byActivity.set(key,entry);
-        activityOrder.push(entry);
-      }
-      return byActivity.get(key);
-    };
-    const normalizeToken=(value)=>{
-      const hasValue=value!==undefined&&value!==null&&String(value)!==''&&String(value)!=='0';
-      return hasValue?String(value):'';
-    };
+  if(!S.busy){
+    inner.querySelectorAll('.tool-call-group:not([data-compression-card]),.tool-card-row:not([data-compression-card]),.agent-activity-thinking:not([data-live-thinking="1"])').forEach(el=>el.remove());
+    const byAssistant = {};
     for(const tc of (S.toolCalls||[])){
-      if(!tc) continue;
-      const aIdx=tc.assistant_msg_idx!==undefined?parseInt(tc.assistant_msg_idx):-1;
-      const segmentSeq=normalizeToken(tc.activitySegmentSeq);
-      const burstId=normalizeToken(tc.activityBurstId);
-      const key=segmentSeq?`segment:${segmentSeq}`:(burstId?`burst:${burstId}`:`assistant:${aIdx}`);
-      const entry=ensureActivityBucket(key,aIdx,segmentSeq,burstId);
-      entry.cards.push(tc);
-      entry.includeAnchorReason=true;
+      const key = tc.assistant_msg_idx !== undefined ? tc.assistant_msg_idx : -1;
+      if(!byAssistant[key]) byAssistant[key] = [];
+      byAssistant[key].push(tc);
     }
-    for(const aIdx of assistantThinking.keys()){
-      const seg=assistantSegments.get(aIdx);
-      const segmentSeq=seg&&seg.getAttribute('data-live-segment-seq')||'';
-      const burstId=seg&&seg.getAttribute('data-activity-burst-id')||'';
-      const key=segmentSeq?`segment:${segmentSeq}`:(burstId?`burst:${burstId}`:`assistant:${aIdx}`);
-      const entry=ensureActivityBucket(key,aIdx,segmentSeq,burstId);
-      if(entry.thinkingIdx===null) entry.thinkingIdx=aIdx;
-    }
-    for(const [aIdx,seg] of assistantSegments){
-      if(!seg||!seg.classList||!seg.classList.contains('assistant-segment-worklog-source')) continue;
-      if(!_worklogReasonHtmlFromAnchor(seg)) continue;
-      const segmentSeq=seg&&seg.getAttribute('data-live-segment-seq')||'';
-      const burstId=seg&&seg.getAttribute('data-activity-burst-id')||'';
-      const key=segmentSeq?`segment:${segmentSeq}`:(burstId?`burst:${burstId}`:`assistant:${aIdx}`);
-      const entry=ensureActivityBucket(key,aIdx,segmentSeq,burstId);
-      entry.includeAnchorReason=true;
-    }
-    activityOrder.sort((a,b)=>{
-      const anchorA=_assistantAnchorForActivity(a.aIdx,a.segmentSeq,a.burstId);
-      const anchorB=_assistantAnchorForActivity(b.aIdx,b.segmentSeq,b.burstId);
-      const idxA=(anchorA&&anchorA.parentElement)?Array.prototype.indexOf.call(anchorA.parentElement.children,anchorA):Number.MAX_SAFE_INTEGER;
-      const idxB=(anchorB&&anchorB.parentElement)?Array.prototype.indexOf.call(anchorB.parentElement.children,anchorB):Number.MAX_SAFE_INTEGER;
-      if(idxA!==idxB) return idxA-idxB;
-      const seqA=a.segmentSeq!==''?Number(a.segmentSeq):Number.MAX_SAFE_INTEGER;
-      const seqB=b.segmentSeq!==''?Number(b.segmentSeq):Number.MAX_SAFE_INTEGER;
-      if(Number.isFinite(seqA)&&Number.isFinite(seqB)&&seqA!==seqB) return seqA-seqB;
-      const burstA=a.burstId!==''?Number(a.burstId):Number.MAX_SAFE_INTEGER;
-      const burstB=b.burstId!==''?Number(b.burstId):Number.MAX_SAFE_INTEGER;
-      if(Number.isFinite(burstA)&&Number.isFinite(burstB)&&burstA!==burstB) return burstA-burstB;
-      return a.aIdx-b.aIdx;
-    });
-    for(const entry of activityOrder){
-      const {aIdx,segmentSeq,burstId,cards,thinkingIdx,includeAnchorReason}=entry;
-      if(aIdx<assistantIdxs[0]) continue;
-      const anchorRow=_assistantAnchorForActivity(aIdx,segmentSeq,burstId);
-      if(!anchorRow) continue;
-      const anchorParent=anchorRow.parentElement;
-      const anchorReasonHtml=_worklogReasonHtmlFromAnchor(anchorRow);
-      const thinkingText=thinkingIdx!==null?assistantThinking.get(thinkingIdx):'';
-      if(!cards.length&&!anchorReasonHtml&&!thinkingText) continue;
-      const anchorTurn=anchorRow.closest('.assistant-turn');
-      if(!anchorTurn) continue;
-      let state=activityByTurn.get(anchorTurn);
-      if(!state){
-        const includeTurnDuration=!durationAssignedTurns.has(anchorTurn);
-        if(includeTurnDuration) durationAssignedTurns.add(anchorTurn);
-        const activityKey=`assistant:${aIdx}`;
-        const anchorIsWorklogSource=anchorRow.classList&&anchorRow.classList.contains('assistant-segment-worklog-source');
-        const group=ensureActivityGroup(anchorParent,{
-          collapsed:true,
-          anchor:anchorRow,
-          beforeAnchor:!!thinkingText&&!anchorIsWorklogSource,
-          syncAnchorReason:anchorIsWorklogSource,
-          activityKey,
-          burstId:burstId||'',
-          segmentSeq:segmentSeq||'',
-          turnDuration:includeTurnDuration?_turnDurationForAnchor(anchorRow):undefined,
-        });
-        const list=_toolWorklogListEl(group);
-        if(!list) continue;
-        list.innerHTML='';
-        state={group,cards:[],seenReasons:new Set(),seenTools:new Set()};
-        activityByTurn.set(anchorTurn,state);
+    const assistantIdxs=[...assistantSegments.keys()].sort((a,b)=>a-b);
+    const anchorInsertAfter = new Map();
+    if(isSimplifiedToolCalling()){
+      const activityIdxs=[...new Set([...Object.keys(byAssistant).map(k=>parseInt(k)), ...assistantThinking.keys()])].sort((a,b)=>a-b);
+      for(const aIdx of activityIdxs){
+        const cards=byAssistant[aIdx]||[];
+        let anchorRow=assistantSegments.get(aIdx)||null;
+        if(!anchorRow&&assistantIdxs.length){
+          if(aIdx<assistantIdxs[0]) continue;
+          const fallbackIdx=[...assistantIdxs].reverse().find(idx=>idx<=aIdx);
+          anchorRow=fallbackIdx!==undefined?assistantSegments.get(fallbackIdx):assistantSegments.get(assistantIdxs[assistantIdxs.length-1]);
+        }
+        if(!anchorRow) continue;
+        const anchorParent=anchorRow.parentElement;
+        let insertAfterNode = anchorInsertAfter.get(anchorRow) || anchorRow;
+        const group=ensureActivityGroup(anchorParent,{collapsed:true,anchor:insertAfterNode,activityKey:`assistant:${aIdx}`});
+        const sourceMsg=S.messages[aIdx]||{};
+        if(sourceMsg._turnDuration!==undefined) group.setAttribute('data-turn-duration', String(sourceMsg._turnDuration));
+        const body=group&&group.querySelector('.tool-call-group-body');
+        if(!body) continue;
+        const thinkingText=assistantThinking.get(aIdx);
+        if(thinkingText){
+          body.appendChild(_thinkingActivityNode(thinkingText, false));
+        }
+        for(const tc of cards){
+          body.appendChild(buildToolCard(tc));
+        }
+        _syncToolCallGroupSummary(group);
+        if(anchorRow) anchorInsertAfter.set(anchorRow, group);
       }
-      state.cards.push(...cards);
-      _appendWorklogStep(state.group, anchorRow, cards, thinkingText, {
-        live:false,
-        includeAnchorReason:!!includeAnchorReason&&!!anchorReasonHtml,
-        thinkingKey:thinkingText?`thinking:${_normalizeThinkingEchoCompare(thinkingText)}`:'',
-        seenReasons:state.seenReasons,
-        seenTools:state.seenTools,
-      });
+    }else if(S.toolCalls && S.toolCalls.length){
+      for(const [key, cards] of Object.entries(byAssistant)){
+        const aIdx = parseInt(key);
+        let anchorRow=assistantSegments.get(aIdx)||null;
+        if(!anchorRow&&assistantIdxs.length){
+          if(aIdx<assistantIdxs[0]) continue;
+          const fallbackIdx=[...assistantIdxs].reverse().find(idx=>idx<=aIdx);
+          anchorRow=fallbackIdx!==undefined?assistantSegments.get(fallbackIdx):assistantSegments.get(assistantIdxs[assistantIdxs.length-1]);
+        }
+        if(!anchorRow) continue;
+        const anchorParent=anchorRow.parentElement;
+        const frag=document.createDocumentFragment();
+        let lastInsertedNode=null;
+        for(const tc of cards){
+          const card=buildToolCard(tc);
+          frag.appendChild(card);
+          lastInsertedNode=card;
+        }
+        // Add expand/collapse toggle for groups with 2+ cards
+        if(cards.length>=2){
+          const toggle=document.createElement('div');
+          toggle.className='tool-cards-toggle';
+          // Collect card elements before they get moved to DOM
+          const cardEls=Array.from(frag.querySelectorAll('.tool-card'));
+          const expandBtn=document.createElement('button');
+          expandBtn.textContent=t('expand_all');
+          expandBtn.onclick=()=>cardEls.forEach(c=>c.classList.add('open'));
+          const collapseBtn=document.createElement('button');
+          collapseBtn.textContent=t('collapse_all');
+          collapseBtn.onclick=()=>cardEls.forEach(c=>c.classList.remove('open'));
+          toggle.appendChild(expandBtn);
+          toggle.appendChild(collapseBtn);
+          frag.insertBefore(toggle,frag.firstChild);
+        }
+        const insertAfterNode = anchorInsertAfter.get(anchorRow) || anchorRow;
+        const refNode = insertAfterNode ? insertAfterNode.nextSibling : null;
+        if(refNode) anchorParent.insertBefore(frag,refNode);
+        else anchorParent.appendChild(frag);
+        if(anchorRow&&lastInsertedNode) anchorInsertAfter.set(anchorRow, lastInsertedNode);
+      }
     }
-    activityByTurn.forEach(state=>{
-      _syncToolCallGroupSummary(state.group);
-    });
   }
   // Render per-turn duration and optional token usage on assistant messages.
   // Duration stays visible even when token usage is disabled, because it answers
@@ -8856,11 +6494,11 @@ function renderMessages(options){
       const failoverText=_gatewayRoutingFailoverText(routing);
       const modelWarningText=_gatewayModelWarningText(routing);
       const hasTurnUsage=!!msg._turnUsage;
-      // The Worklog summary owns the "Done in …" duration whenever this
-      // assistant message contributes tool or thinking detail to a folded
-      // Worklog above the final answer.
-      const compactWorklogForMessage=isSimplifiedToolCalling()&&(toolCallAssistantIdxs.has(mi)||assistantThinking.has(mi));
-      const durationText=compactWorklogForMessage?'':_formatTurnDuration(msg._turnDuration);
+      const compactActivityForMessage=isSimplifiedToolCalling()&&(
+        assistantThinking.has(mi)||
+        (S.toolCalls||[]).some(tc=>tc&&(tc.assistant_msg_idx!==undefined?tc.assistant_msg_idx:-1)===mi)
+      );
+      const durationText=compactActivityForMessage?'':_formatTurnDuration(msg._turnDuration);
       if(!hasTurnUsage&&!durationText&&!gatewayText&&!failoverText&&!modelWarningText) continue;
       const seg=assistantSegments.get(mi);
       const row=seg?seg.closest('.assistant-turn'):null;
@@ -8911,161 +6549,9 @@ function renderMessages(options){
       }
     }
   }
-  // Fail-safe invariant (#3875): a settled assistant turn must never render with
-  // ZERO visible content. The Worklog redesign (#3401) folds intermediate
-  // assistant segments into a collapsed Worklog card and hides the source segment
-  // (`assistant-segment-worklog-source` → display:none). That is correct WHEN the
-  // turn also has a visible final answer. But when a turn's ONLY content is folded
-  // into a collapsed Worklog (e.g. an autonomous/interrupted run whose final
-  // assistant message is empty, or a reload where S.toolCalls didn't hydrate so the
-  // worklog card built with no expandable tool steps), every segment is hidden and
-  // the turn paints as nothing — leaving the transcript a bare stack of date
-  // separators (#3875 brick). Reveal such turns so their content is never silently
-  // swallowed: expand the turn's Worklog group(s) when the turn has no other
-  // visible content. This NEVER touches a turn that has any visible segment, so the
-  // intended collapsed-Worklog UX is preserved whenever a visible answer exists.
-  // The live turn is excluded by its `liveAssistantTurn` id (it drives its own
-  // state during a stream), so this sweep is safe to run even while busy — a
-  // historical blank turn must not re-paint blank during a follow-up stream
-  // (Opus advisor, stage-342).
-  {
-    const _turnHasVisibleContent=(turn)=>{
-      const segs=turn.querySelectorAll('.assistant-segment');
-      for(const seg of segs){
-        // A segment shows real content only when it is NOT worklog-folded AND its
-        // body/files/status actually painted (the anchor-only placeholder class
-        // carries no visible body).
-        if(seg.classList.contains('assistant-segment-worklog-source')) continue;
-        if(seg.classList.contains('assistant-segment-anchor')) continue;
-        if((seg.textContent||'').trim()) return true;
-      }
-      return false;
-    };
-    for(const turn of inner.querySelectorAll('.assistant-turn')){
-      if(turn.id==='liveAssistantTurn') continue; // live turn drives its own state
-      if(_turnHasVisibleContent(turn)) continue;
-      // No visible content — surface the folded Worklog so the turn isn't blank.
-      const groups=turn.querySelectorAll('.tool-worklog-group,.tool-call-group');
-      let revealed=false;
-      for(const group of groups){
-        if(!(group.textContent||'').trim()) continue; // empty group can't help
-        if(group.classList.contains('tool-call-group-collapsed')){
-          group.classList.remove('tool-call-group-collapsed');
-          group.classList.add('open');
-          const summary=group.querySelector('.tool-call-group-summary,.activity-summary');
-          if(summary) summary.setAttribute('aria-expanded','true');
-        }
-        // `revealed` means "this turn has a non-empty Worklog group that the user
-        // can see" — NOT "we just expanded something". An already-open non-empty
-        // group is itself visible (it slips past _turnHasVisibleContent only
-        // because that check inspects .assistant-segment nodes, not group bodies),
-        // so the turn isn't truly blank and the last-resort un-hide below is
-        // unnecessary. Keep this assignment OUTSIDE the if(collapsed) branch.
-        revealed=true;
-      }
-      // Last resort: no usable worklog group either, but hidden worklog-source
-      // segments carry the real text — un-hide them so nothing is lost.
-      if(!revealed){
-        for(const seg of turn.querySelectorAll('.assistant-segment-worklog-source')){
-          if(!(seg.textContent||'').trim()) continue;
-          seg.classList.remove('assistant-segment-worklog-source');
-          seg.removeAttribute('aria-hidden');
-        }
-      }
-    }
-  }
-  // Re-attach the preserved live turn (#3877). The rebuild above recreated a
-  // live turn from S.messages, but the live assistant message's content lags the
-  // stream (it is only persisted to S.messages on a throttled write-back) — so the
-  // fresh node often shows LESS streamed text than the ORIGINAL node, which is
-  // still referenced by the smd parser and holds the real in-progress reply. Swap
-  // the preserved (parser) node back in so the parser target stays connected and
-  // the visible text never blanks.
-  //
-  // The swap fires when the preserved node carries at least as much streamed text
-  // as the rebuilt one (`_rebuiltLen <= _preservedLen`). The `<=` (not `<`) is
-  // load-bearing: at the throttled-persist boundary the rebuilt turn's live
-  // content can EQUAL the preserved length, and the old `<` guard then skipped the
-  // swap — leaving the smd parser writing into the detached original node, which
-  // is exactly the residual "disappears, then reappears" frame (#3877 reopen). On
-  // a tie the preserved node is strictly preferable (it holds the live parser
-  // reference; identical length means nothing is lost). When the rebuilt turn
-  // genuinely has MORE content (e.g. a reconnect where S.messages caught up past
-  // the parser), the guard correctly skips and lets the parser re-resolve to the
-  // fuller node.
-  //
-  // Swap at the SEGMENT level — replace only the rebuilt live segment with the
-  // preserved one — so a multi-segment turn (earlier settled segments + tool/
-  // worklog groups built by the rebuild) keeps that rebuilt-only structure; a
-  // whole-turn replaceWith would discard it when the preserved snapshot predates
-  // those segments. Fall back to whole-turn replace only when the rebuilt turn has
-  // no live segment to swap into. No-op for a settled turn or when nothing was
-  // streaming.
-  if(_preservedLiveTurn){
-    const _rebuilt=document.getElementById('liveAssistantTurn');
-    // Pick the PARSER-OWNED live segment, not just the first one. On reconnect /
-    // post-tool activity boundaries a live turn can carry MULTIPLE
-    // [data-live-assistant="1"] segments, and the smd parser writes into the
-    // LAST (tail) one (see ensureAssistantRow in messages.js — it re-attaches to
-    // the last live segment). Prefer the preserved segment whose
-    // data-live-segment-seq matches the rebuilt tail (same logical segment), then
-    // fall back to the last preserved live segment. Using querySelector() (first)
-    // here would move the wrong segment and leave the parser-owned tail detached
-    // in a multi-segment turn.
-    const _rebuiltSegs=_rebuilt?_rebuilt.querySelectorAll('[data-live-assistant="1"]'):null;
-    const _rebuiltSeg=(_rebuiltSegs&&_rebuiltSegs.length)?_rebuiltSegs[_rebuiltSegs.length-1]:null;
-    const _preservedSegs=_preservedLiveTurn.querySelectorAll('[data-live-assistant="1"]');
-    let _preservedSeg=_preservedSegs.length?_preservedSegs[_preservedSegs.length-1]:null;
-    const _rebuiltSeq=_rebuiltSeg?_rebuiltSeg.getAttribute('data-live-segment-seq'):null;
-    if(_rebuiltSeq){
-      for(const _seg of _preservedSegs){
-        if(_seg.getAttribute('data-live-segment-seq')===_rebuiltSeq){_preservedSeg=_seg;break;}
-      }
-    }
-    const _preservedLen=_liveAssistantSegmentTextLength(_preservedSeg||_preservedLiveTurn);
-    if(_preservedLen>0){
-      const _rebuiltLen=_rebuilt?_liveAssistantSegmentTextLength(_rebuiltSeg||_rebuilt):-1;
-      if(_rebuiltLen<=_preservedLen){
-        // Decide segment-level vs whole-turn restore. Segment-level keeps the
-        // rebuilt turn's structure (good when the rebuild is the structural
-        // superset). But the whole premise here is that the live DOM can be
-        // AHEAD of S.messages: a tool/worklog group can land in the live turn
-        // between the last throttled persist and this rebuild, so the rebuilt
-        // turn (built from the lagging S.messages) may have FEWER structural
-        // blocks. In that case a segment-only swap would drop those live-only
-        // blocks for a frame — so restore the WHOLE preserved turn instead.
-        // Otherwise (rebuild has >= the preserved turn's structural blocks) do
-        // the precise segment swap so rebuilt-only structure is kept.
-        const _structuralCount=(turn)=> turn?turn.querySelectorAll(
-          '[data-live-assistant="1"],.tool-call-group,.tool-card-row,'+
-          '.tool-worklog-group,.live-worklog[data-live-worklog-shell="1"],'+
-          '.wl-reason,.agent-activity-thinking,.thinking-card-row'
-        ).length:0;
-        const _preservedStructure=_structuralCount(_preservedLiveTurn);
-        const _rebuiltStructure=_structuralCount(_rebuilt);
-        if(_rebuilt&&_rebuiltSeg&&_preservedSeg&&_rebuiltStructure>=_preservedStructure){
-          // Rebuild is the structural superset — swap only the parser-owned
-          // (tail) live segment, keeping rebuilt-only segments / tool groups.
-          // (No dataset.sessionId stamp here: only the segment enters the DOM;
-          // the rebuilt turn was already stamped at build time, see above.)
-          _rebuiltSeg.replaceWith(_preservedSeg);
-        }else if(_rebuilt){
-          // Rebuilt turn lacks structure the live turn already has (live-only
-          // tool card not yet persisted), or has no live segment to target —
-          // restore the whole preserved turn so nothing the user saw vanishes.
-          if(S.session) _preservedLiveTurn.dataset.sessionId=S.session.session_id;
-          _rebuilt.replaceWith(_preservedLiveTurn);
-        }else{
-          if(S.session) _preservedLiveTurn.dataset.sessionId=S.session.session_id;
-          inner.appendChild(_preservedLiveTurn);
-        }
-      }
-    }
-  }
   // Only force-scroll when not actively streaming — mid-stream re-renders
   // (tool completion, session switch) must not override the user's scroll position.
   // scrollIfPinned() respects _scrollPinned, so it's a no-op if user scrolled up.
-  if(typeof _syncLiveRunStatusAfterRender==='function') _syncLiveRunStatusAfterRender();
   _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
   // Apply syntax highlighting after DOM is built
   requestAnimationFrame(()=>postProcessRenderedMessages(inner));
@@ -9077,11 +6563,10 @@ function renderMessages(options){
   if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(inner);
   // Populate session cache so switching back here skips a full rebuild.
   _sessionHtmlCacheSid=sid;
-  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){
+  if(sid&&!hasTransientTranscriptUi){
     const _html=inner.innerHTML;
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
     if(_html.length<300_000){
-      const renderSignature=cachedRenderSignature===null?_messageRenderCacheSignature():cachedRenderSignature;
       _sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowSize,signature:renderSignature});
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
     }
@@ -9093,261 +6578,6 @@ function _toolDisplayName(tc){
   if(name==='subagent_progress') return 'Subagent';
   if(name==='delegate_task') return 'Delegate task';
   return name;
-}
-
-// Activity-summary detection for persisted memory/skill writes (#3340, #3544).
-// Action vocabularies match the real agent tool enums:
-//   memory.action      = add | replace | remove   (add/replace persist content → "saved")
-//   skill_manage.action= create | patch | edit | delete | write_file | remove_file
-//                        (create/patch/edit/write_file mutate a skill → "updated")
-// Deletions (memory 'remove', skill 'delete'/'remove_file') are intentionally
-// excluded so the "saved"/"updated" label verbs stay accurate; running/errored
-// calls are excluded so only completed writes are counted.
-const _MEMORY_SAVE_ACTIONS=new Set(['add','replace']);
-const _SKILL_UPDATE_ACTIONS=new Set(['create','patch','edit','write_file']);
-function _tcAction(tc){
-  return String((tc&&tc.args&&tc.args.action)||'').toLowerCase();
-}
-function _isMemorySave(tc){
-  if(!tc||tc.name!=='memory'||tc.done===false||tc.is_error) return false;
-  return _MEMORY_SAVE_ACTIONS.has(_tcAction(tc));
-}
-function _isSkillUpdate(tc){
-  if(!tc||tc.name!=='skill_manage'||tc.done===false||tc.is_error) return false;
-  return _SKILL_UPDATE_ACTIONS.has(_tcAction(tc));
-}
-// ── Tool action label helpers ──────────────────────────────────────────────
-function _decodeToolLabelEntities(value){
-  return String(value||'')
-    .replace(/&quot;/g,'"')
-    .replace(/&#39;|&apos;/g,"'")
-    .replace(/&lt;/g,'<')
-    .replace(/&gt;/g,'>')
-    .replace(/&amp;/g,'&');
-}
-function _redactToolTargetLabel(value){
-  return String(value||'')
-    .replace(/\bsshpass\s+-p\s+(?:"[^"]*"|'[^']*'|\S+)/gi,'sshpass -p "[redacted]"')
-    .replace(/(--password(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,'$1[redacted]')
-    .replace(/(password(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,'$1[redacted]');
-}
-function _shortToolLabel(value, limit){
-  const text=String(value||'').replace(/\s+/g,' ').trim();
-  const max=limit||112;
-  if(text.length<=max) return text;
-  const head=Math.max(24, Math.floor(max*.68));
-  const tail=Math.max(12, max-head-3);
-  return text.slice(0,head).trimEnd()+'...'+text.slice(-tail).trimStart();
-}
-function _toolActionKind(tc){
-  const n=String(tc&&tc.name||'').toLowerCase().replace(/[^a-z0-9]+/g,'_');
-  if(!n) return 'unknown';
-  if(n==='subagent_progress'||n==='delegate_task') return 'delegate';
-  if(n.includes('terminal')||n.includes('shell')||n.includes('command')||n.includes('process')||n==='execute_code') return 'shell';
-  if(n.includes('read')||n.includes('view')||n.includes('open')||n==='vision_analyze') return 'read';
-  if(n.includes('list')||n==='todo') return 'list';
-  if(n.includes('web')||n.includes('fetch')||n.includes('curl')||n.includes('extract')||n.includes('browse')||n.includes('navigate')) return 'web';
-  if(n.includes('search')||n.includes('grep')||n.includes('find')) return 'search';
-  if(n.includes('write')||n.includes('patch')||n.includes('edit')) return 'write';
-  return 'unknown';
-}
-function _toolTargetLabel(tc){
-  const a=tc&&tc.args||{};
-  const raw=a.cmd||a.command||a.path||a.file||a.uri||a.url||a.query||a.pattern||a.dir||a.task||tc.preview||'';
-  return _redactToolTargetLabel(_decodeToolLabelEntities(String(raw).split('\n')[0].trim()));
-}
-function _toolVisibleTargetLabel(tc, opts){
-  opts=opts||{};
-  const target=_toolTargetLabel(tc);
-  if(!target) return '';
-  return _shortToolLabel(target, opts.limit||112);
-}
-function _toolCommandTitle(command){
-  const normalized=String(command||'').replace(/\s+/g,' ').trim();
-  if(!normalized) return '';
-  if(/^git\s+fetch\b/i.test(normalized)) return 'git fetch';
-  if(/^git\s+(?:status|rev-list|branch)\b/i.test(normalized)) return 'git ahead/behind';
-  if(/^git\s+log\b/i.test(normalized)) return 'git log';
-  if(/\bcurl\b/i.test(normalized)&&/\/health\b/i.test(normalized)) return 'health check';
-  if(/\b(?:ps|pgrep)\b/i.test(normalized)) return 'process check';
-  const m=normalized.match(/\blsof\b.*(?:-i|:)(\d{2,5})\b/i);
-  if(m) return `port ${m[1]} check`;
-  if(/\blaunchctl\b/i.test(normalized)) return 'launchctl';
-  return _shortToolLabel(normalized,72);
-}
-function _toolQueryTitle(query){
-  const normalized=String(query||'').replace(/\s+/g,' ').trim();
-  return _shortToolLabel(normalized,72);
-}
-function _toolActionLabelText(tc, opts){
-  opts=opts||{};
-  const kind=_toolActionKind(tc);
-  const done=tc&&tc.done!==false;
-  const isErr=tc&&tc.is_error;
-  let target=opts.generic?'':_toolVisibleTargetLabel(tc, opts);
-  if(kind==='shell'&&target) target=_toolCommandTitle(target);
-  else if((kind==='search'||kind==='web')&&target) target=_toolQueryTitle(target);
-  const verbs={
-    shell:   {ing:'Running',   ed:'Ran'},
-    read:    {ing:'Reading',   ed:'Read'},
-    list:    {ing:'Listing',   ed:'Listed'},
-    search:  {ing:'Searching for',ed:'Searched for'},
-    web:     {ing:'Checking',  ed:'Checked'},
-    write:   {ing:'Updating',  ed:'Updated'},
-    delegate:{ing:'Delegating',ed:'Delegated'},
-    unknown: {ing:'Running',   ed:'Ran'},
-  };
-  const v=verbs[kind]||verbs.unknown;
-  const display=_toolDisplayName(tc);
-  if(isErr){
-    return target?`Failed ${v.ing.toLowerCase()} ${target}`:`Failed ${v.ing.toLowerCase()} ${display}`;
-  }
-  if(done) return target?`${v.ed} ${target}`:`${v.ed} ${display}`;
-  return target?`${v.ing} ${target}`:`${v.ing} ${display}`;
-}
-function _toolActionLabel(tc){
-  return esc(_toolActionLabelText(tc,{limit:112}));
-}
-const _toolWorklogSummaries={
-  shell:{running:'Running a command',runningMany:'Running {n} commands',done:'Ran a command',doneMany:'Ran {n} commands'},
-  read:{running:'Reading a file',runningMany:'Read {n} files',done:'Read a file',doneMany:'Read {n} files'},
-  list:{running:'Listing files',runningMany:'Listed {n} items',done:'Listed files',doneMany:'Listed {n} files'},
-  search:{running:'Searching workspace',runningMany:'Searching workspace {n} times',done:'Searched workspace',doneMany:'Searched workspace {n} times'},
-  web:{running:'Checking web',runningMany:'Checked web {n} times',done:'Checked the web',doneMany:'Checked the web {n} times'},
-  write:{running:'Updating a file',runningMany:'Updated {n} files',done:'Wrote a file',doneMany:'Wrote {n} files'},
-  delegate:{running:'Delegating a task',runningMany:'Delegated {n} tasks',done:'Delegated a task',doneMany:'Delegated {n} tasks'},
-  unknown:{running:'Running a tool',runningMany:'Running {n} tools',done:'Ran a tool',doneMany:'Ran {n} tools'},
-};
-function _toolWorklogActionParts(tc){
-  if(tc&&tc.nodeType===1){
-    const row=tc.classList&&tc.classList.contains('tool-card-row')?tc:tc.closest&&tc.closest('.tool-card-row');
-    const card=tc.classList&&tc.classList.contains('tool-card')?tc:(row&&row.querySelector('.tool-card'));
-    const actionLabel=(row&&row.dataset.toolActionLabel)||(card&&card.querySelector('.tool-card-name')&&card.querySelector('.tool-card-name').textContent.trim())||'';
-    const kind=(row&&row.dataset.toolKind)||'unknown';
-    const isDone=!((row&&row.dataset.toolDone)==='false'||(card&&card.classList.contains('tool-card-running')));
-    const isErr=(row&&row.dataset.toolError)==='true'||(card&&card.classList.contains('tool-card-error'));
-    return {kind,isDone,isErr,target:'',summary:_toolWorklogSummaries[kind]||_toolWorklogSummaries.unknown,actionLabel};
-  }
-  const kind=_toolActionKind(tc);
-  return {
-    kind,
-    isDone:tc&&tc.done!==false,
-    isErr:tc&&tc.is_error,
-    target:_toolTargetLabel(tc),
-    summary:_toolWorklogSummaries[kind]||_toolWorklogSummaries.unknown,
-    actionLabel:_toolActionLabelText(tc),
-  };
-}
-function _toolWorklogSummary(toolCalls, opts){
-  const cards=Array.from(toolCalls||[]).filter(tc=>tc);
-  if(!cards.length) return (opts&&opts.live)?'Running':'Worklog';
-  if(cards.length===1){
-    const part=_toolWorklogActionParts(cards[0]);
-    const fmt=part.summary||_toolWorklogSummaries.unknown;
-    const line=part.isDone?fmt.done:fmt.running;
-    return part.isErr?`${line}, 1 failed`:line;
-  }
-  const order=['shell','read','write','search','web','list','delegate','unknown'];
-  const runningCounts={}, doneCounts={};
-  let failed=0;
-  for(const tc of cards){
-    const part=_toolWorklogActionParts(tc);
-    const counts=part.isDone?doneCounts:runningCounts;
-    counts[part.kind]=(counts[part.kind]||0)+1;
-    if(part.isErr) failed+=1;
-  }
-  const emit=(counts,state)=>{
-    const out=[];
-    for(const kind of order){
-      const n=counts[kind]||0;
-      if(!n) continue;
-      const fmt=_toolWorklogSummaries[kind]||_toolWorklogSummaries.unknown;
-      if(n===1) out.push(state==='done'?fmt.done:fmt.running);
-      else out.push((state==='done'?fmt.doneMany:fmt.runningMany).replace('{n}',String(n)));
-    }
-    return out;
-  };
-  const lines=[...emit(runningCounts,'running'),...emit(doneCounts,'done')];
-  if(failed) lines.push(`${failed} failed`);
-  return lines.length?lines.map((line,idx)=>idx===0?line:line.charAt(0).toLowerCase()+line.slice(1)).join(', '):_toolActionLabel(cards[0]);
-}
-function _toolWorklogListEl(group){
-  if(!group) return null;
-  return group.querySelector('.tool-worklog-list') || group.querySelector('.activity-body') || group.querySelector('.tool-call-group-body');
-}
-function _toolWorklogToolsEl(group){
-  const list=_toolWorklogListEl(group);
-  if(!list) return null;
-  let tools=list.querySelector(':scope > .wl-step-tools[data-worklog-tools="1"]');
-  if(!tools){
-    tools=document.createElement('div');
-    tools.className='wl-step-tools tool-worklog-tools';
-    tools.setAttribute('data-worklog-tools','1');
-    list.appendChild(tools);
-  }
-  return tools;
-}
-function _liveToolStepEl(group){
-  const list=_toolWorklogListEl(group);
-  if(!list) return null;
-  const last=list.lastElementChild;
-  if(last&&last.classList&&last.classList.contains('wl-step-tools')&&last.getAttribute('data-worklog-tools')==='1') return last;
-  const tools=document.createElement('div');
-  tools.className='wl-step-tools tool-worklog-tools';
-  tools.setAttribute('data-worklog-tools','1');
-  list.appendChild(tools);
-  return tools;
-}
-function _directWorklogToolRows(list){
-  if(!list) return [];
-  const rows=[];
-  Array.from(list.children).forEach(child=>{
-    if(child.classList&&child.classList.contains('tool-card-row')) rows.push(child);
-    else if(child.classList&&(child.classList.contains('tool-worklog-tool-group')||child.classList.contains('tool-group'))) rows.push(...Array.from(child.querySelectorAll('.tool-card-row')));
-  });
-  return rows;
-}
-function _unwrapNestedToolGroups(tools){
-  if(!tools) return;
-  tools.querySelectorAll(':scope > .tool-worklog-tool-group,:scope > .tool-group').forEach(el=>el.remove());
-}
-function _syncToolRowsContainer(tools, isLiveWorklog){
-  if(!tools) return;
-  const rows=_directWorklogToolRows(tools);
-  _unwrapNestedToolGroups(tools);
-  rows.forEach(row=>{ if(row.parentElement) row.remove(); });
-  tools.querySelectorAll(':scope > .tool-card-row').forEach(row=>row.remove());
-  const shouldGroup=tools.classList.contains('wl-step-tools') && rows.length>1;
-  if(!shouldGroup){
-    rows.forEach(row=>tools.appendChild(row));
-    return;
-  }
-  const hasRunning=rows.some(row=>row&&row.dataset&&row.dataset.toolDone==='false');
-  const shouldOpen=_worklogDetailsExpandedDefault();
-  const group=document.createElement('div');
-  group.className='tool-group'+(shouldOpen?' open':' tool-worklog-tool-group-collapsed');
-  group.setAttribute('data-tool-worklog-tool-group','1');
-  const summary=hasRunning?'Running':_toolWorklogSummary(rows,{live:isLiveWorklog, toolCount:rows.length});
-  group.innerHTML=`<button type="button" class="tool-group-head tool-worklog-tool-group-head" aria-expanded="${shouldOpen?'true':'false'}" onclick="_toggleToolWorklogGroup(this)"><span class="tg-sum tool-worklog-tool-group-label">${esc(summary)}</span><span class="tool-call-group-chevron tg-caret">${li('chevron-right',12)}</span></button><div class="tool-group-body tool-worklog-tool-group-body"><div class="tg-rows tool-worklog-tool-group-rows"></div></div>`;
-  const body=group.querySelector('.tg-rows');
-  rows.forEach(row=>body.appendChild(row));
-  tools.appendChild(group);
-}
-function _syncToolWorklogToolGroup(group){
-  const list=_toolWorklogListEl(group);
-  if(!list) return;
-  const isLiveWorklog=!!(group.getAttribute('data-live-tool-worklog-group')==='1' || group.getAttribute('data-live-tool-call-group')==='1');
-  const steps=Array.from(list.querySelectorAll(':scope > .wl-step-tools[data-worklog-tools="1"]'));
-  if(!steps.length){
-    const pendingRows=_directWorklogToolRows(list);
-    if(!pendingRows.length) return;
-    const tools=_toolWorklogToolsEl(group);
-    if(!tools) return;
-    pendingRows.forEach(row=>tools.appendChild(row));
-    _syncToolRowsContainer(tools,isLiveWorklog);
-    return;
-  }
-  steps.forEach(tools=>_syncToolRowsContainer(tools,isLiveWorklog));
 }
 function toolIcon(name){
   const icons={
@@ -9372,74 +6602,11 @@ function toolIcon(name){
   return icons[name]||li('wrench');
 }
 
-function _toolArgPreviewValue(value){
-  if(value===null||value===undefined) return '';
-  if(Array.isArray(value)){
-    if(!value.length) return '[]';
-    if(value.length<=3&&value.every(v=>v===null||['string','number','boolean'].includes(typeof v))){
-      return value.map(v=>String(v)).join(', ');
-    }
-    return `${value.length} items`;
-  }
-  if(typeof value==='object') return 'object';
-  return String(value).replace(/\s+/g,' ').trim();
-}
-// Secret/sensitive-arg guard for collapsed tool-card previews. Exact-name hiding
-// alone misses camelCase / variant spellings (apiKey, access_token, clientSecret,
-// Authorization, …), so a normalized substring check runs first so secret-shaped
-// argument names are never surfaced in the always-visible collapsed header (#3267).
-function _toolArgPreviewKeyIsHidden(key){
-  const k=String(key||'').toLowerCase().replace(/[^a-z0-9]/g,'');
-  // verbose-but-not-secret bodies we keep out of the compact preview
-  const verbose=['content','filecontent','newstring','oldstring','patch','text','message','prompt','code','script','cookies','headers'];
-  if(verbose.includes(k)) return true;
-  // secret-shaped substrings (covers api_key/apiKey, access_token/auth_token/bearer,
-  // client_secret, password, credential, private_key, authorization, etc.)
-  return /(apikey|token|secret|password|passwd|credential|authorization|\bauth\b|auth$|^auth|bearer|privatekey|accesskey|sessionkey|signingkey|cookie)/.test(k)
-    || k==='auth' || k==='key' || k==='pat';
-}
-function _formatToolArgPreview(args){
-  if(!args||typeof args!=='object') return '';
-  const preferred=['path','file_path','target','pattern','query','url','urls','name','ref','command','action','mode','schedule','workdir'];
-  const keys=[];
-  for(const key of preferred){
-    if(Object.prototype.hasOwnProperty.call(args,key)&&!_toolArgPreviewKeyIsHidden(key)) keys.push(key);
-  }
-  for(const key of Object.keys(args)){
-    if(keys.length>=3) break;
-    if(keys.includes(key)||_toolArgPreviewKeyIsHidden(key)) continue;
-    keys.push(key);
-  }
-  const parts=[];
-  for(const key of keys){
-    const raw=_toolArgPreviewValue(args[key]);
-    if(!raw) continue;
-    const val=raw.length>96?`${raw.slice(0,93)}…`:raw;
-    parts.push(`${key}=${val}`);
-    if(parts.join(' · ').length>=150) break;
-  }
-  const out=parts.join(' · ');
-  return out.length>180?`${out.slice(0,177)}…`:out;
-}
-function _toolCardPreviewText(tc, displaySnippet){
-  const explicit=String(tc&&tc.preview||'').trim();
-  if(explicit) return explicit;
-  const argPreview=_formatToolArgPreview(tc&&tc.args);
-  if(argPreview) return argPreview;
-  if(tc&&tc.done===false) return 'Running';
-  if(tc&&tc.is_error) return 'Failed';
-  return 'Completed';
-}
 function buildToolCard(tc){
   const row=document.createElement('div');
   row.className='tool-card-row';
-  if(!row.dataset) row.dataset={};
-  row.dataset.toolKind=typeof _toolActionKind==='function'?_toolActionKind(tc):'unknown';
-  row.dataset.toolDone=String(tc&&tc.done!==false);
-  row.dataset.toolError=String(!!(tc&&tc.is_error));
-  row.dataset.toolActionLabel=typeof _toolActionLabelText==='function'?_toolActionLabelText(tc):_toolDisplayName(tc);
   const icon=toolIcon(tc.name);
-  const hasDetail=(tc.snippet&&tc.snippet!==tc.preview)||(tc.args&&Object.keys(tc.args).length>0);
+  const hasDetail=tc.snippet||(tc.args&&Object.keys(tc.args).length>0);
   let displaySnippet='';
   if(tc.snippet){
     const s=tc.snippet;
@@ -9456,11 +6623,10 @@ function buildToolCard(tc){
   const runIndicator=tc.done===false?'<span class="tool-card-running-dot"></span>':'';
   const isSubagent=tc.name==='subagent_progress';
   const isDelegation=tc.name==='delegate_task';
-  const openClass=hasDetail&&_worklogDetailsExpandedDefault()?' open':'';
-  const cardClass='tool-card'+(tc.done===false?' tool-card-running':'')+(isSubagent?' tool-card-subagent':'')+openClass;
+  const cardClass='tool-card'+(tc.done===false?' tool-card-running':'')+(isSubagent?' tool-card-subagent':'');
   // Clean up legacy subagent prefixes since the Lucide icon already shows it
   let displayName=_toolDisplayName(tc);
-  let previewText=_toolCardPreviewText(tc, displaySnippet);
+  let previewText=tc.preview||displaySnippet||'';
   if(isSubagent) previewText=previewText.replace(/^(?:\u{1F500}|↳)\s*/u,'');
   row.innerHTML=`
     <div class="${cardClass}">
@@ -9476,112 +6642,27 @@ function buildToolCard(tc){
           Object.entries(tc.args).map(([k,v])=>`<div><span class="tool-arg-key">${esc(k)}</span> <span class="tool-arg-val">${esc(String(v))}</span></div>`).join('')
         }</div>`:''}
         ${displaySnippet?`<div class="tool-card-result">
-          <pre>${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?`<code class="diff-block" data-highlighted="1">${_colorDiffLines(displaySnippet)}</code>`:esc(displaySnippet)}</pre>
-          ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
+          <pre>${esc(displaySnippet)}</pre>
+          ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();const p=this.previousElementSibling;const full=this.dataset.full;const short=this.dataset.short;p.textContent=p.textContent===short?full:short;this.textContent=p.textContent===short?this.dataset.moreLabel:this.dataset.lessLabel">${esc(moreLabel)}</button>`:''}
         </div>`:''}
       </div>`:''}
     </div>`;
-  row._tcData = tc;
-  // Durable classification flags: _tcData (a JS property) does NOT survive the
-  // outerHTML/innerHTML snapshot+restore the live tool-call group uses on session
-  // switch/restore, which would make _syncToolCallGroupSummary re-count restored
-  // memory/skill rows as generic tools and silently drop the suffix. Mirror the
-  // classification onto data-* attributes so it survives serialization. (#3544)
-  if(_isMemorySave(tc)){row.setAttribute('data-memory-save','1');row.removeAttribute('data-skill-update');}
-  else if(_isSkillUpdate(tc)){row.setAttribute('data-skill-update','1');row.removeAttribute('data-memory-save');}
-  else {row.removeAttribute('data-memory-save');row.removeAttribute('data-skill-update');}
   return row;
-}
-
-function _colorDiffLines(text){
-  if(typeof text !== 'string') return esc(String(text||''));
-  return esc(text).split('\n').map(line=>{
-    if(line.startsWith('@@')) return `<span class="diff-line diff-hunk">${line}</span>`;
-    if(line.startsWith('+')&&!line.startsWith('+++')) return `<span class="diff-line diff-plus">${line}</span>`;
-    if(line.startsWith('-')&&!line.startsWith('---')) return `<span class="diff-line diff-minus">${line}</span>`;
-    return `<span class="diff-line">${line}</span>`;
-  }).join('\n');
-}
-
-// Detect if text looks like a unified diff (has @@ hunk headers and +/- lines).
-function _snippetLooksLikeDiff(text){
-  if(typeof text!=='string'||text.length<10) return false;
-  if(!/^@@\s/.test(text)) return false;
-  const lines=text.split('\n');
-  let plusMinus=0;
-  for(let i=0;i<lines.length&&i<50;i++){
-    const l=lines[i];
-    if(l.startsWith('+')||l.startsWith('-')) plusMinus++;
-  }
-  return plusMinus>=2;
-}
-
-function _toggleToolDiff(btn){
-  const pre=btn.closest('.tool-card-result')?.querySelector('pre');
-  if(!pre) return;
-  const isDiff=btn.dataset.isDiff==='1';
-  const expanded=btn.textContent===btn.dataset.moreLabel;
-  const raw=expanded?btn.dataset.full:btn.dataset.short;
-  if(isDiff){
-    let code=pre.querySelector('code');
-    if(!code){code=document.createElement('code');code.className='diff-block';pre.textContent='';pre.appendChild(code);}
-    code.innerHTML=_colorDiffLines(raw);
-  }else{
-    pre.textContent=raw;
-  }
-  btn.textContent=expanded?btn.dataset.lessLabel:btn.dataset.moreLabel;
 }
 
 function _syncToolCallGroupSummary(group){
   if(!group) return;
-  if(group.getAttribute('data-tool-worklog-group')==='1') _syncToolWorklogToolGroup(group);
-  const cards=Array.from((_toolWorklogListEl(group)||group).querySelectorAll('.tool-card-row .tool-card,.tool-card-row.tl'));
+  const cards=Array.from(group.querySelectorAll('.tool-card-row .tool-card'));
   const toolCount=cards.length;
-  const label=group.querySelector('.tool-worklog-label') || group.querySelector('.tool-call-group-label');
-  const isWorklogGroup=!!(group.getAttribute('data-tool-worklog-group')==='1');
-  const isLiveWorklog=!!(group.getAttribute('data-live-tool-worklog-group')==='1' || group.getAttribute('data-live-tool-call-group')==='1');
-  const hasRunningTool=cards.some(card=>card.classList.contains('tool-card-running'));
-  if(isWorklogGroup){
-    if(hasRunningTool) group.setAttribute('data-tool-worklog-running','1');
-    else group.removeAttribute('data-tool-worklog-running');
-  }
+  const label=group.querySelector('.tool-call-group-label');
   const durationEl=group.querySelector('.tool-call-group-duration');
   if(label){
-    if(group.getAttribute('data-run-activity-group')==='1'){
-      label.textContent=toolCount?_toolWorklogSummary(cards,{live:isLiveWorklog, toolCount}):'Running';
-    }else if(isWorklogGroup){
-      label.textContent=_toolWorklogSummary(cards,{live:isLiveWorklog, toolCount, labelOnly:!toolCount&&isLiveWorklog});
-      if(!label.textContent) label.textContent=isLiveWorklog?'Running':'Worklog';
-    }else{
-      const rows=Array.from(group.querySelectorAll('.tool-card-row'));
-      // Prefer the live _tcData classification; fall back to the durable data-*
-      // flags for rows restored from an HTML snapshot (which drops JS properties).
-      const isMem=r=>_isMemorySave(r._tcData)||r.getAttribute('data-memory-save')==='1';
-      const isSkill=r=>_isSkillUpdate(r._tcData)||r.getAttribute('data-skill-update')==='1';
-      const memCount=rows.filter(isMem).length;
-      const skillCount=rows.filter(r=>!isMem(r)&&isSkill(r)).length;
-      const otherCount=Math.max(0, toolCount-memCount-skillCount);
-      let suffix='';
-      if(memCount) suffix+=`, ${memCount} ${memCount===1?'memory':'memories'} saved`;
-      if(skillCount) suffix+=`, ${skillCount} ${skillCount===1?'skill':'skills'} updated`;
-      const toolsPart=otherCount?`${otherCount} tool${otherCount===1?'':'s'}`:'';
-      if(group.getAttribute('data-live-tool-call-group')==='1'){
-        if(toolsPart) label.textContent=`Activity: ${toolsPart}${suffix}`;
-        else if(suffix) label.textContent=`Activity: ${suffix.slice(2)}`;
-        else label.textContent='Running';
-      }else if(toolsPart||suffix){
-        label.textContent=toolsPart?`Activity: ${toolsPart}${suffix}`:`Activity: ${suffix.slice(2)}`;
-      }else label.textContent='Activity';
-    }
+    if(toolCount) label.textContent=`Activity: ${toolCount} tool${toolCount===1?'':'s'}`;
+    else label.textContent='Activity';
     label.setAttribute('data-sweep-label', label.textContent);
   }
   if(durationEl){
-    if(group.getAttribute('data-run-activity-group')==='1'){
-      const durationText=_formatTurnDuration(group.dataset.turnDuration);
-      const label=durationText?'':_activityElapsedLabel(group);
-      durationEl.textContent=durationText?` Done in ${durationText}`:(label?` Working for ${label}`:'');
-      durationEl.style.display=durationEl.textContent?'':'none';
-    }else if(group.getAttribute('data-live-tool-call-group')==='1'){
+    if(group.getAttribute('data-live-tool-call-group')==='1'){
       const activeText=_activityElapsedLabel(group);
       const progressText=_activityLiveProgressLabel(group);
       if(activeText) group.setAttribute('data-active-turn-elapsed',activeText);
@@ -9590,7 +6671,7 @@ function _syncToolCallGroupSummary(group){
       durationEl.style.display=durationEl.textContent?'':'none';
     }else{
       const durationText=_formatTurnDuration(group.dataset.turnDuration);
-      durationEl.textContent=durationText?` Done in ${durationText}`:'';
+      durationEl.textContent=durationText?`Done in ${durationText}`:'';
       durationEl.style.display=durationText?'':'none';
     }
   }
@@ -9608,35 +6689,11 @@ function _activityProgressLabelForToolName(name){
   return 'Working';
 }
 
-function _activityLatestToolName(group){
-  if(!group) return '';
-  const running=group.querySelector('.tool-card.tool-card-running .tool-card-name');
-  const latest=running || Array.from(group.querySelectorAll('.tool-card-name')).pop();
-  return latest?String(latest.textContent||'').trim():'';
-}
-
-function _activityWaitingDetail(group,label=''){
-  const toolName=_activityLatestToolName(group);
-  if(toolName){
-    const action=_activityProgressLabelForToolName(toolName);
-    if(group&&group.querySelector('.tool-card.tool-card-running')) return `${action}: ${toolName}. Results will appear here.`;
-    return `Last step: ${action} (${toolName}); now choosing the next action or composing a response.`;
-  }
-  if(String(label||'').toLowerCase().includes('model')) return 'Reviewing the prompt and context, then choosing the next action or composing the response.';
-  return 'The agent is running; tool results and response text will appear here.';
-}
-
 function _activityLiveProgressLabel(group){
   if(!group||group.getAttribute('data-live-tool-call-group')!=='1') return '';
-  const idleAge=_activityLastObservedAge(group);
-  if(idleAge!==null&&idleAge>=90) return `No recent activity for ${_formatActiveElapsedTimer(idleAge)}`;
   const running=group.querySelector('.tool-card.tool-card-running .tool-card-name');
-  const latest=running?String(running.textContent||'').trim():_activityLatestToolName(group);
-  const waiting=group.querySelector('.agent-activity-status-waiting .agent-activity-status-label');
-  if(latest) return _activityProgressLabelForToolName(latest);
-  if(waiting&&waiting.textContent&&String(waiting.textContent).toLowerCase().includes('model')) return 'Reviewing prompt and context';
-  if(waiting&&waiting.textContent) return waiting.textContent;
-  return 'Starting agent';
+  const latest=running || Array.from(group.querySelectorAll('.tool-card-name')).pop();
+  return _activityProgressLabelForToolName(latest?latest.textContent:'');
 }
 
 // ── Live tool card helpers (called during SSE streaming) ──
@@ -9650,9 +6707,6 @@ function appendLiveToolCard(tc){
   // Guard: ignore if session was switched. Prevents stale tool events from
   // a previous session's SSE stream from manipulating the new session's DOM.
   if(!S.session||!S.activeStreamId) return;
-  const opts=arguments[1]||{};
-  if(opts.sessionId&&S.session.session_id!==opts.sessionId) return;
-  if(opts.streamId&&S.activeStreamId!==opts.streamId) return;
   let turn=$('liveAssistantTurn');
   if(!turn){
     turn=_createAssistantTurn();
@@ -9662,94 +6716,71 @@ function appendLiveToolCard(tc){
   }
   const inner=_assistantTurnBlocks(turn);
   if(!inner) return;
-  const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
+  const tid=tc.tid||'';
+  if(!isSimplifiedToolCalling()){
+    // Update existing card in place (tool_complete after tool_start)
+    if(tid){
+      const existing=inner.querySelector(`.tool-card-row[data-live-tid="${CSS.escape(tid)}"]`);
+      if(existing){
+        const replacement=buildToolCard(tc);
+        replacement.dataset.liveTid=tid;
+        existing.replaceWith(replacement);
+        // Keep #toolRunningRow alive — dots stay until text starts streaming
+        // or the next tool fires (which replaces them). Removing here caused
+        // a gap between tool completion and the first text token arriving.
+        return;
+      }
+    }
+    const row=buildToolCard(tc);
+    if(tid) row.dataset.liveTid=tid;
+    // Insert after whichever comes last: the current live assistant segment or
+    // the last tool card. This handles both cases:
+    //   text → tool1 → tool2  (no text between tools: anchor is card1)
+    //   text1 → tool1 → text2 → tool2  (text between tools: anchor is text2)
+    const children=Array.from(inner.children);
+    // Include .thinking-card-row so tool cards land AFTER a finalized thinking
+    // card, not between the text segment and thinking.
+    const anchor=children.filter(el=>el.matches('[data-live-assistant="1"],.tool-card-row,.thinking-card-row')).pop();
+    if(anchor) anchor.insertAdjacentElement('afterend', row);
+    else inner.appendChild(row);
+    // Add a 3-dot waiting indicator below the tool card so there's visual
+    // feedback while the tool is running. Removed when text starts streaming
+    // (ensureAssistantRow) or when tool_complete fires.
+    const oldWait=$('toolRunningRow');if(oldWait)oldWait.remove();
+    const waitRow=document.createElement('div');
+    waitRow.id='toolRunningRow';
+    waitRow.className='assistant-segment';
+    waitRow.innerHTML='<div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>';
+    row.insertAdjacentElement('afterend', waitRow);
+    if(typeof scrollIfPinned==='function') scrollIfPinned();
+    return;
+  }
   const children=Array.from(inner.children);
-  const burstId=tc.activityBurstId!==undefined&&tc.activityBurstId!==null&&String(tc.activityBurstId)!=='0'?String(tc.activityBurstId):'';
-  const segmentSeq=tc.activitySegmentSeq!==undefined&&tc.activitySegmentSeq!==null&&String(tc.activitySegmentSeq)!=='0'?String(tc.activitySegmentSeq):'';
-  const segmentAnchor=segmentSeq?_findLiveAssistantAnchorForSegment(inner, segmentSeq):null;
-  const burstAnchor=burstId?_findLatestVisibleLiveAssistantByBurst(inner, burstId):null;
-  const anchor=segmentAnchor||burstAnchor||_findLatestVisibleLiveAssistant(inner)||children.filter(el=>el.matches('[data-live-assistant="1"]')).pop();
-  const effectiveSegmentSeq=anchor&&anchor.getAttribute?anchor.getAttribute('data-live-segment-seq')||segmentSeq:segmentSeq;
-  if(anchor) _removeEmptyLiveWorklogShells(inner);
-  const group=ensureLiveWorklogContainer(inner,{
-    anchor,
-    activityKey:_activityKeyForLiveTurn(),
-    segmentSeq:effectiveSegmentSeq,
-    burstId,
-  });
-  const list=_liveToolStepEl(group);
-  if(!list) return;
-  // toolComplete can replace the existing live card with the same tid.
+  const anchor=children.filter(el=>el.matches('[data-live-assistant="1"],.tool-call-group,.tool-card-row,.agent-activity-thinking')).pop();
+  const group=ensureActivityGroup(inner,{live:true,collapsed:true,anchor,activityKey:_activityKeyForLiveTurn()});
+  const body=group.querySelector('.tool-call-group-body');
+  // Update existing card in place (tool_complete after tool_start)
   if(tid){
-    const existing=group.querySelector(`.tool-card-row[data-live-tid="${CSS.escape(tid)}"]`);
+    const existing=body.querySelector(`.tool-card-row[data-live-tid="${CSS.escape(tid)}"]`);
     if(existing){
       const replacement=buildToolCard(tc);
       replacement.dataset.liveTid=tid;
       existing.replaceWith(replacement);
       _syncToolCallGroupSummary(group);
-      _moveLiveRunStatusToTurnEnd();
-      if(typeof scrollIfPinned==='function') scrollIfPinned();
       return;
     }
   }
-  const worklog=_toolWorklogListEl(group) || list;
-  const waiting=worklog.querySelector('.agent-activity-status[data-activity-event-id="thinking-placeholder"] .agent-activity-status-label');
-  if(waiting&&tc.done===false) waiting.textContent='Waiting on tool result';
   const row=buildToolCard(tc);
   if(tid) row.dataset.liveTid=tid;
-  list.appendChild(row);
+  body.appendChild(row);
   _syncToolCallGroupSummary(group);
-  _moveLiveRunStatusToTurnEnd();
   if(typeof scrollIfPinned==='function') scrollIfPinned();
-}
-
-function _findLatestLiveAssistantByBurst(inner, burstId){
-  if(!inner || !burstId) return null;
-  const candidates=Array.from(inner.querySelectorAll(`[data-live-assistant="1"][data-activity-burst-id="${CSS.escape(String(burstId))}"]`))
-    .filter(el=>el.isConnected!==false);
-  return candidates[candidates.length-1] || null;
-}
-function _findLatestLiveAssistantBySegment(inner, segmentSeq){
-  if(!inner || !segmentSeq) return null;
-  const candidates=Array.from(inner.querySelectorAll(`[data-live-assistant="1"][data-live-segment-seq="${CSS.escape(String(segmentSeq))}"]`)).filter(el=>el.isConnected!==false);
-  return candidates[candidates.length-1] || null;
-}
-function _liveAssistantHasVisibleText(el){
-  if(!el||!el.matches||!el.matches('[data-live-assistant="1"]')) return false;
-  const body=el.querySelector&&el.querySelector('.msg-body');
-  const text=(body?body.textContent:el.textContent)||el.dataset&&el.dataset.rawText||'';
-  return !!String(text||'').trim();
-}
-function _findPreviousVisibleLiveAssistant(inner, beforeNode){
-  if(!inner) return null;
-  let node=beforeNode&&beforeNode.previousElementSibling;
-  while(node){
-    if(_liveAssistantHasVisibleText(node)) return node;
-    node=node.previousElementSibling;
-  }
-  return null;
-}
-function _findLatestVisibleLiveAssistant(inner){
-  if(!inner) return null;
-  const candidates=Array.from(inner.querySelectorAll('[data-live-assistant="1"]')).filter(el=>el.isConnected!==false&&_liveAssistantHasVisibleText(el));
-  return candidates[candidates.length-1] || null;
-}
-function _findLatestVisibleLiveAssistantByBurst(inner, burstId){
-  if(!inner || !burstId) return null;
-  const candidates=Array.from(inner.querySelectorAll(`[data-live-assistant="1"][data-activity-burst-id="${CSS.escape(String(burstId))}"]`))
-    .filter(el=>el.isConnected!==false&&_liveAssistantHasVisibleText(el));
-  return candidates[candidates.length-1] || null;
-}
-function _findLiveAssistantAnchorForSegment(inner, segmentSeq){
-  const exact=_findLatestLiveAssistantBySegment(inner, segmentSeq);
-  if(exact&&_liveAssistantHasVisibleText(exact)) return exact;
-  return _findPreviousVisibleLiveAssistant(inner, exact) || _findLatestVisibleLiveAssistant(inner) || exact;
 }
 
 function clearLiveToolCards(){
   if(typeof _clearActivityElapsedTimer==='function') _clearActivityElapsedTimer();
   const inner=_assistantTurnBlocks($('liveAssistantTurn'));
-  if(inner) inner.querySelectorAll('.live-worklog[data-live-worklog-shell],.tool-worklog-group[data-live-tool-call-group],.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid]').forEach(el=>el.remove());
+  if(inner) inner.querySelectorAll('.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid]').forEach(el=>el.remove());
   // Reset the per-turn user expand intent so the next turn starts at the
   // default collapsed state (#1298).
   if(typeof _clearLiveActivityUserIntent==='function') _clearLiveActivityUserIntent();
@@ -9757,36 +6788,6 @@ function clearLiveToolCards(){
   // leftover cards were inserted there before this refactor took effect.
   const container=$('liveToolCards');
   if(container){container.innerHTML='';container.style.display='none';}
-}
-function _removeEmptyLiveWorklogShells(inner){
-  if(!inner) return;
-  inner.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-worklog-shell="1"],.tool-call-group[data-live-worklog-shell="1"]').forEach(group=>{
-    if(!group.querySelector('.tool-card-row,.wl-reason,.agent-activity-thinking')) group.remove();
-  });
-}
-function ensureLiveWorklogShell(){
-  if(!S.session||!S.activeStreamId) return null;
-  $('emptyState').style.display='none';
-  if(!isSimplifiedToolCalling()){
-    appendThinking();
-    return $('thinkingRow');
-  }
-  let turn=$('liveAssistantTurn');
-  if(!turn){
-    turn=_createAssistantTurn();
-    turn.id='liveAssistantTurn';
-    if(S.session) turn.dataset.sessionId=S.session.session_id;
-    $('msgInner').appendChild(turn);
-  }
-  const blocks=_assistantTurnBlocks(turn);
-  if(!blocks) return null;
-  const group=ensureLiveWorklogContainer(blocks,{
-    activityKey:_activityKeyForLiveTurn(),
-  });
-  if(!group) return null;
-  _moveLiveRunStatusToTurnEnd();
-  scrollIfPinned();
-  return group;
 }
 
 // ── Edit + Regenerate ──
@@ -9899,22 +6900,11 @@ function postProcessRenderedMessages(container) {
 }
 
 function highlightCode(container) {
-  // Apply Prism.js syntax highlighting only to *new* code blocks.
-  // Previously every renderMessages() called Prism.highlightAllUnder() which
-  // re-scanned and re-highlighted every <pre> in the container — expensive in
-  // long sessions with dozens of code blocks.  Now we only touch blocks that
-  // don't already have the data-highlighted marker.
-  if(typeof Prism === 'undefined') return;
+  // Apply Prism.js syntax highlighting to all code blocks in container (or whole messages area)
+  if(typeof Prism === 'undefined' || !Prism.highlightAllUnder) return;
   const el = container || $('msgInner');
   if(!el) return;
-  // Prefer per-element highlight (avoids the full DOM walk of highlightAllUnder)
-  const blocks = el.querySelectorAll('pre code:not([data-highlighted])');
-  if(blocks.length === 0) return;
-  for(let i = 0; i < blocks.length; i++){
-    const block = blocks[i];
-    if(typeof Prism.highlightElement === 'function') Prism.highlightElement(block);
-    block.dataset.highlighted = '1';
-  }
+  Prism.highlightAllUnder(el);
 }
 
 // Lazy load js-yaml for YAML tree view support
@@ -9924,8 +6914,8 @@ function _loadJsyamlThen(cb){
   if(_jsyamlLoading){ setTimeout(()=>_loadJsyamlThen(cb),100); return; }
   _jsyamlLoading=true;
   const s=document.createElement('script');
-  s.src='static/vendor/js-yaml/4.1.0/js-yaml.min.js';
-  s.integrity='sha384-+pxiN6T7yvpryuJmE1gM9PX7yQit15auDb+ZwwvJOd/4be2Cie5/IuVXgQb/S9du';
+  s.src='https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js';
+  s.integrity='sha384-8pLvVQkv7pCQqFk7AChLpdEe7gXz9h8GAb7cS0zVeJuKhxR5PU5aEET5pRpHZvxUorzdM';
   s.crossOrigin='anonymous';
   s.onload=()=>{ _jsyamlLoading=false; cb(); };
   s.onerror=()=>{ _jsyamlLoading=false; }; // CDN blocked, fall back to raw
@@ -10297,7 +7287,7 @@ function loadPdfInline(container){
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="api/media?path=${encodeURIComponent(path)}&download=1" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_too_large')}</span></div>`;
             return;
           }
-          return pdfjsLib.getDocument({data:buf, isEvalSupported:false}).promise;
+          return pdfjsLib.getDocument({data:buf}).promise;
         })
         .then(pdf=>{
           if(!pdf) return;
@@ -10330,14 +7320,16 @@ function loadPdfInline(container){
       loadPdf(window._pdfjsLib);
     } else if(!_pdfjsLoading){
       _pdfjsLoading=true;
-      const _pdfSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.9.155/build/pdf.min.mjs';
-      const _pdfWorker='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.9.155/build/pdf.worker.min.mjs';
-      const _pdfBlob=new Blob([`import*as p from'${_pdfSrc}';p.GlobalWorkerOptions.workerSrc='${_pdfWorker}';window._pdfjsLib=p;window._pdfjsReady=true;window.dispatchEvent(new Event('pdfjs-ready'));`],{type:'application/javascript'});
       const s=document.createElement('script');
+      s.src='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.9.155/build/pdf.min.mjs';
       s.type='module';
-      const _pdfBlobUrl=URL.createObjectURL(_pdfBlob);
-      s.src=_pdfBlobUrl;
-      s.onload=()=>URL.revokeObjectURL(_pdfBlobUrl);
+      s.textContent=`
+        import * as pdfjsLib from '${s.src}';
+        pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.9.155/build/pdf.worker.min.mjs';
+        window._pdfjsLib=pdfjsLib;
+        window._pdfjsReady=true;
+        window.dispatchEvent(new Event('pdfjs-ready'));
+      `;
       document.head.appendChild(s);
       window.addEventListener('pdfjs-ready',()=>{ _pdfjsReady=true; loadPdf(window._pdfjsLib); },{once:true});
       setTimeout(()=>{
@@ -10432,25 +7424,8 @@ function renderMermaidBlocks(container){
 let _katexLoading=false;
 let _katexReady=false;
 
-function _isStreamingEquationPending(el,root){
-  const tagName=(el&&el.tagName||'').toLowerCase();
-  if(tagName!=='equation-block'&&tagName!=='equation-inline') return false;
-  // streaming-markdown fills custom equation elements while the parser owns the
-  // open node. If the equation is currently the last descendant of the live
-  // assistant body, we cannot tell whether more TeX is still coming. Skip it
-  // during live debounce passes so a partial source is not permanently marked
-  // data-rendered before the final parser_end flush.
-  let node=el;
-  while(node&&node!==root){
-    if(node.nextSibling) return false;
-    node=node.parentNode;
-  }
-  return Boolean(node===root);
-}
-
-function renderKatexBlocks(container,options){
+function renderKatexBlocks(container){
   const root=container||document;
-  const streaming=Boolean(options&&options.streaming);
   const blocks=root.querySelectorAll(
     '.katex-block:not([data-rendered]),.katex-inline:not([data-rendered]),'+
     'equation-block:not([data-rendered]),equation-inline:not([data-rendered])'
@@ -10460,7 +7435,7 @@ function renderKatexBlocks(container,options){
     if(!_katexLoading){
       _katexLoading=true;
       const script=document.createElement('script');
-      script.src='static/vendor/katex/0.16.22/katex.min.js';
+      script.src='https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js';
       script.integrity='sha384-cMkvdD8LoxVzGF/RPUKAcvmm49FQ0oxwDF3BGKtDXcEc+T1b2N+teh/OJfpU0jr6';
       script.crossOrigin='anonymous';
       script.onload=()=>{
@@ -10474,7 +7449,6 @@ function renderKatexBlocks(container,options){
     return;
   }
   blocks.forEach(el=>{
-    if(streaming&&_isStreamingEquationPending(el,root)) return;
     el.dataset.rendered='true';
     const src=el.textContent||'';
     const tagName=(el.tagName||'').toLowerCase();
@@ -10495,7 +7469,7 @@ function renderKatexBlocks(container,options){
 
 function _thinkingMarkup(text=''){
   const clean=_sanitizeThinkingDisplayText(text);
-  const openClass=_worklogDetailsExpandedDefault()?' open':'';
+  const openClass=isSimplifiedToolCalling()?'':' open';
   return (clean&&String(clean).trim())
     ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(String(clean).trim())}</pre></div></div>`
     : `<div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>`;
@@ -10526,7 +7500,7 @@ function finalizeThinkingCard(){
     if(!row) return;
     // If the row is still just a spinner (no thinking content rendered),
     // remove it entirely — it's the initial waiting dots.
-    const hasContent=!!row.querySelector('.thinking-card');
+    const hasContent=row.querySelector('.thinking-card') || row.classList.contains('thinking-card-row');
     if(!hasContent && row.getAttribute('data-thinking-active')==='1'){
       row.remove();
       return;
@@ -10544,14 +7518,19 @@ function finalizeThinkingCard(){
     return;
   }
   const turn=$('liveAssistantTurn');
-  const group=turn&&turn.querySelector('.live-worklog[data-live-tool-call-group="1"],.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"]');
+  const group=turn&&turn.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
   if(group){
-    const activeReason=turn.querySelector('.wl-reason[data-worklog-reason-active="1"]');
-    if(activeReason) activeReason.removeAttribute('data-worklog-reason-active');
-    turn.querySelectorAll('.agent-activity-thinking[data-thinking-active="1"]').forEach(active=>{
-      active.removeAttribute('data-thinking-active');
-      active.removeAttribute('data-live-thinking');
-    });
+    // Respect the user's explicit expand intent (#1298) — only force-collapse
+    // when the user has not manually expanded this turn's activity group, or
+    // has manually collapsed it. Otherwise the panel snaps shut whenever new
+    // activity arrives, even mid-read.
+    if(_liveActivityUserExpanded !== true){
+      group.classList.add('tool-call-group-collapsed');
+      const summary=group.querySelector('.tool-call-group-summary');
+      if(summary) summary.setAttribute('aria-expanded','false');
+    }
+    const active=turn.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
+    if(active) active.removeAttribute('data-thinking-active');
     _syncToolCallGroupSummary(group);
   }
 }
@@ -10559,74 +7538,80 @@ function appendThinking(text='', options){
   // Guard: ignore if session was switched during an async SSE stream.
   // The old stream's reasoning events can still fire after switch;
   // without this check they would pollute the new session's DOM.
-  options=options||{};
   const allowPendingPlaceholder=!!(options&&options.pending===true);
   if(!S.session||(!S.activeStreamId&&!allowPendingPlaceholder)) return;
-  const empty=$('emptyState');
-  if(empty) empty.style.display='none';
-  if(!isSimplifiedToolCalling()){
-    let row=$('thinkingRow');
-    if(!row){
-      row=document.createElement('div');
-      row.id='thinkingRow';
-      row.className='thinking-card-row';
-      const inner=$('msgInner');
-      if(inner) inner.appendChild(row);
-    }
-    row.setAttribute('data-thinking-active','1');
-    _renderThinkingInto(row,text);
-    if(typeof scrollIfPinned==='function') scrollIfPinned();
-    return;
-  }
+  $('emptyState').style.display='none';
   let turn=$('liveAssistantTurn');
   if(!turn){
     turn=_createAssistantTurn();
     turn.id='liveAssistantTurn';
-    if(S.session) turn.dataset.sessionId=S.session.session_id;
-    const inner=$('msgInner');
-    if(inner) inner.appendChild(turn);
+    if(S.session) turn.dataset.sessionId=S.session.session_id;  // see #1366
+    $('msgInner').appendChild(turn);
   }
   const blocks=_assistantTurnBlocks(turn);
   if(!blocks) return;
-  const clean=_sanitizeThinkingDisplayText(text);
-  if(clean&&window._showThinking!==false){
-    const segmentSeq=options.segmentSeq!==undefined&&options.segmentSeq!==null?String(options.segmentSeq):'';
-    const burstId=options.burstId!==undefined&&options.burstId!==null?String(options.burstId):'';
-    const thinkingKey=String(options.thinkingKey||(
-      segmentSeq?`segment:${segmentSeq}`:
-      burstId?`burst:${burstId}`:
-      'turn'
-    ));
-    const group=ensureLiveWorklogContainer(blocks,{
-      activityKey:options.activityKey||(S.activeStreamId?'live:'+S.activeStreamId:null),
-    });
-    const list=_toolWorklogListEl(group);
-    if(list){
-      let row=list.querySelector(`.agent-activity-thinking[data-live-thinking="1"][data-live-thinking-key="${CSS.escape(thinkingKey)}"]`);
-      if(!row){
-        row=_thinkingActivityNode(clean, false);
-        row.setAttribute('data-live-thinking','1');
-        row.setAttribute('data-live-thinking-key',thinkingKey);
-        if(segmentSeq) row.setAttribute('data-live-segment-seq',segmentSeq);
-        if(burstId) row.setAttribute('data-activity-burst-id',burstId);
-        list.querySelectorAll('.agent-activity-thinking[data-thinking-active="1"]').forEach(el=>{
-          if(el!==row){
-            el.removeAttribute('data-thinking-active');
-            el.removeAttribute('data-live-thinking');
-          }
-        });
-        row.setAttribute('data-thinking-active','1');
-        list.appendChild(row);
-      }else{
-        _renderThinkingInto(row, clean);
-      }
+  if(!isSimplifiedToolCalling()){
+    let row=$('thinkingRow');
+    if(!row){
+      row=document.createElement('div');
+      row.className='assistant-segment';
+      row.id='thinkingRow';
       row.setAttribute('data-thinking-active','1');
-      _syncToolCallGroupSummary(group);
+      // Insert after whichever comes last: a live assistant segment or a tool card.
+      // This mirrors appendLiveToolCard's anchor logic so thinking always appears
+      // in the right position in the interleaved sequence.
+      // Also skip #toolRunningRow (dots) — thinking should go before dots, not after.
+      const allChildren=Array.from(blocks.children);
+      const anchor=allChildren.filter(el=>
+        el.id!=='toolRunningRow' &&
+        el.matches('[data-live-assistant="1"],.tool-card-row')
+      ).pop();
+      if(anchor) anchor.insertAdjacentElement('afterend', row);
+      else blocks.appendChild(row);
     }
+    const clean=_sanitizeThinkingDisplayText(text);
+    const hasClean=!!String(clean||'').trim();
+    row.className=hasClean?'assistant-segment thinking-card-row':'assistant-segment';
+    _renderThinkingInto(row,text);
+    scrollIfPinned();
+    // Auto-scroll the thinking card body to bottom if the user is watching
+    // (scroll pinned). If the user scrolled up to read history, leave it alone.
+    if(_scrollPinned){
+      const body=row&&row.querySelector('.thinking-card-body');
+      if(body) body.scrollTop=body.scrollHeight;
+    }
+    return;
   }
-  if(typeof scrollIfPinned==='function') scrollIfPinned();
+  const thinkingText=String(text||'').trim()||'Thinking…';
+  const allChildren=Array.from(blocks.children);
+  const anchor=allChildren.filter(el=>
+    el.id!=='toolRunningRow' &&
+    el.matches('[data-live-assistant="1"],.tool-call-group,.tool-card-row')
+  ).pop();
+  const group=ensureActivityGroup(blocks,{live:true,collapsed:true,anchor,activityKey:_activityKeyForLiveTurn()});
+  const body=group&&group.querySelector('.tool-call-group-body');
+  if(!body) return;
+  let row=body.querySelector('.agent-activity-thinking[data-thinking-active="1"]');
+  if(!row){
+    const thinkingCards=Array.from(body.querySelectorAll('.agent-activity-thinking'));
+    row=thinkingCards.pop()||null;
+    if(row) row.setAttribute('data-thinking-active','1');
+  }
+  if(!row){
+    row=_thinkingActivityNode(thinkingText, false);
+    row.setAttribute('data-thinking-active','1');
+    body.appendChild(row);
+  }else{
+    _renderThinkingInto(row,thinkingText);
+  }
+  _syncToolCallGroupSummary(group);
+  scrollIfPinned();
+  if(_scrollPinned){
+    const body=row&&row.querySelector('.thinking-card-body');
+    if(body) body.scrollTop=body.scrollHeight;
+  }
 }
-function updateThinking(text='', options){appendThinking(text, options);}
+function updateThinking(text=''){appendThinking(text);}
 function removeThinking(){
   if(!isSimplifiedToolCalling()){
     const el=$('thinkingRow');
@@ -10680,8 +7665,6 @@ function renderBreadcrumb(){
   root.className='breadcrumb-seg breadcrumb-link';
   root.textContent='~';
   root.onclick=()=>loadDir('.');
-  _bindWorkspaceMoveDropTarget(root,'.');
-  _bindWorkspaceOsUploadDropTarget(root,'.');
   bar.appendChild(root);
   // Path segments
   const parts=S.currentDir.split('/');
@@ -10697,8 +7680,6 @@ function renderBreadcrumb(){
       seg.className='breadcrumb-seg breadcrumb-link';
       const target=accumulated;
       seg.onclick=()=>loadDir(target);
-      _bindWorkspaceMoveDropTarget(seg,target);
-      _bindWorkspaceOsUploadDropTarget(seg,target);
     } else {
       seg.className='breadcrumb-seg breadcrumb-current';
     }
@@ -10922,16 +7903,6 @@ function _copyTextWithFallback(text, successMsg, failurePrefix){
   return Promise.resolve();
 }
 
-function _workspaceCreateTargetLabel(targetDir){
-  return targetDir && targetDir !== '.' ? targetDir : t('workspace_root');
-}
-
-function _workspaceJoinTargetPath(targetDir, name){
-  const cleanName=String(name||'').trim();
-  if(!cleanName) return '';
-  return (!targetDir||targetDir==='.') ? cleanName : `${targetDir}/${cleanName}`;
-}
-
 function _showWorkspaceRootContextMenu(e){
   document.querySelectorAll('.file-ctx-menu').forEach(el=>el.remove());
   const menu=document.createElement('div');
@@ -10940,20 +7911,6 @@ function _showWorkspaceRootContextMenu(e){
   const vw=window.innerWidth,vh=window.innerHeight;
   menu.style.left=(e.clientX+160>vw?e.clientX-170:e.clientX)+'px';
   menu.style.top=(e.clientY+80>vh?e.clientY-80:e.clientY)+'px';
-
-  menu.appendChild(_workspaceContextMenuItem(t('new_file'),async()=>{
-    menu.remove();
-    await promptNewFile('.');
-  }));
-
-  menu.appendChild(_workspaceContextMenuItem(t('new_folder'),async()=>{
-    menu.remove();
-    await promptNewFolder('.');
-  }));
-
-  const createSep=document.createElement('hr');
-  createSep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
-  menu.appendChild(createSep);
 
   menu.appendChild(_workspaceContextMenuItem(t('reveal_in_finder'),async()=>{
     menu.remove();
@@ -11007,109 +7964,13 @@ function renderFileTree(){
   _renderTreeItems(box, visibleEntries, 0);
 }
 
-function _isWorkspaceTreeMoveDrag(e){
-  return !!(e.dataTransfer&&e.dataTransfer.types&&e.dataTransfer.types.includes('application/ws-path')&&!e.dataTransfer.types.includes('Files'));
-}
-
-function _workspaceParentDir(relPath){
-  if(!relPath||relPath==='.')return '.';
-  const idx=relPath.lastIndexOf('/');
-  return idx===-1?'.':relPath.substring(0,idx);
-}
-
-function _clearWorkspaceMoveDragOver(){
-  document.querySelectorAll('.file-item.drag-over,.breadcrumb-seg.drag-over').forEach(el=>el.classList.remove('drag-over'));
-}
-
-function _remapWorkspaceCachesAfterMove(oldPath,newPath,isDir){
-  if(isDir&&S._expandedDirs){
-    if(S._expandedDirs.has(oldPath)){
-      S._expandedDirs.delete(oldPath);
-      S._expandedDirs.add(newPath);
-    }
-    for(const expandedPath of [...S._expandedDirs]){
-      if(expandedPath.startsWith(oldPath+'/')){
-        S._expandedDirs.delete(expandedPath);
-        S._expandedDirs.add(newPath+expandedPath.slice(oldPath.length));
-      }
-    }
-    if(S._dirCache[oldPath]){
-      S._dirCache[newPath]=S._dirCache[oldPath];
-      delete S._dirCache[oldPath];
-    }
-    for(const cachePath of Object.keys(S._dirCache)){
-      if(cachePath.startsWith(oldPath+'/')){
-        const remapped=newPath+cachePath.slice(oldPath.length);
-        S._dirCache[remapped]=S._dirCache[cachePath];
-        delete S._dirCache[cachePath];
-      }
-    }
-    if(typeof _saveExpandedDirs==='function')_saveExpandedDirs();
-  }
-  delete S._dirCache[_workspaceParentDir(oldPath)];
-  delete S._dirCache[_workspaceParentDir(newPath)];
-  if(typeof _previewCurrentPath!=='undefined'&&_previewCurrentPath){
-    if(_previewCurrentPath===oldPath)_previewCurrentPath=newPath;
-    else if(_previewCurrentPath.startsWith(oldPath+'/'))_previewCurrentPath=newPath+_previewCurrentPath.slice(oldPath.length);
-  }
-}
-
-async function _performWorkspaceMove(srcPath,destDir,isDir){
-  if(!S.session||!srcPath)return;
-  const normDest=destDir||'.';
-  if(srcPath===normDest)return;
-  if(normDest.startsWith(srcPath+'/'))return;
-  if(_workspaceParentDir(srcPath)===normDest)return;
-  try{
-    const data=await api('/api/file/move',{method:'POST',body:JSON.stringify({
-      session_id:S.session.session_id,path:srcPath,dest_dir:normDest
-    })});
-    const movedName=data.new_path.includes('/')?data.new_path.slice(data.new_path.lastIndexOf('/')+1):data.new_path;
-    showToast((t('moved_to')||'Moved to ')+movedName);
-    _remapWorkspaceCachesAfterMove(data.old_path||srcPath,data.new_path||srcPath,isDir);
-    await loadDir(S.currentDir);
-    if(typeof refreshOpenPreviewIfMutated==='function')await refreshOpenPreviewIfMutated();
-  }catch(err){
-    showToast((t('move_failed')||'Move failed: ')+err.message,5000,'error');
-  }
-}
-
-function _bindWorkspaceMoveDropTarget(el,destDir){
-  el.ondragenter=(e)=>{
-    if(!_isWorkspaceTreeMoveDrag(e))return;
-    e.preventDefault();e.stopPropagation();
-    el.classList.add('drag-over');
-  };
-  el.ondragover=(e)=>{
-    if(!_isWorkspaceTreeMoveDrag(e))return;
-    e.preventDefault();e.stopPropagation();
-    e.dataTransfer.dropEffect='move';
-    el.classList.add('drag-over');
-  };
-  el.ondragleave=(e)=>{
-    if(el.contains(e.relatedTarget))return;
-    el.classList.remove('drag-over');
-  };
-  el.ondrop=async(e)=>{
-    if(!_isWorkspaceTreeMoveDrag(e))return;
-    e.preventDefault();e.stopPropagation();
-    el.classList.remove('drag-over');
-    const srcPath=e.dataTransfer.getData('application/ws-path');
-    if(!srcPath)return;
-    const srcType=e.dataTransfer.getData('application/ws-type');
-    await _performWorkspaceMove(srcPath,destDir,srcType==='dir');
-  };
-}
-
 function _renderTreeItems(container, entries, depth){
   for(const item of entries){
     const el=document.createElement('div');el.className='file-item';
     el.style.paddingLeft=(8+depth*16)+'px';
     el.setAttribute('draggable','true');
-    el.dataset.wsType=item.type;
     el.oncontextmenu=(e)=>{e.preventDefault();e.stopPropagation();_showFileContextMenu(e,item);};
-    el.ondragstart=(e)=>{e.dataTransfer.setData('application/ws-path',item.path);e.dataTransfer.setData('application/ws-type',item.type);e.dataTransfer.effectAllowed='copy';el.classList.add('dragging');};
-    el.ondragend=()=>{el.classList.remove('dragging');_clearWorkspaceMoveDragOver();};
+    el.ondragstart=(e)=>{e.dataTransfer.setData('application/ws-path',item.path);e.dataTransfer.setData('application/ws-type',item.type);e.dataTransfer.effectAllowed='copy';};
 
     if(item.type==='dir'){
       // Toggle arrow for directories
@@ -11224,8 +8085,6 @@ function _renderTreeItems(container, entries, depth){
     }
 
     if(item.type==='dir'){
-      _bindWorkspaceMoveDropTarget(el,item.path);
-      _bindWorkspaceOsUploadDropTarget(el,item.path);
       // Single-click toggles expand/collapse
       el.onclick=async(e)=>{
         e.stopPropagation();
@@ -11291,21 +8150,6 @@ function _showFileContextMenu(e, item){
   const vw=window.innerWidth,vh=window.innerHeight;
   menu.style.left=(e.clientX+140>vw?e.clientX-150:e.clientX)+'px';
   menu.style.top=(e.clientY+100>vh?e.clientY-100:e.clientY)+'px';
-  const targetDir=item.type==='dir' ? item.path : _workspaceParentDir(item.path);
-
-  menu.appendChild(_workspaceContextMenuItem(t('new_file'),async()=>{
-    menu.remove();
-    await promptNewFile(targetDir);
-  }));
-
-  menu.appendChild(_workspaceContextMenuItem(t('new_folder'),async()=>{
-    menu.remove();
-    await promptNewFolder(targetDir);
-  }));
-
-  const createSep=document.createElement('hr');
-  createSep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
-  menu.appendChild(createSep);
 
   // Rename
   const renameItem=document.createElement('div');
@@ -11353,6 +8197,10 @@ function _showFileContextMenu(e, item){
         await navigator.clipboard.writeText(abs);
         showToast(t('path_copied'));
       }catch(clipErr){
+        // Fallback for browsers where Clipboard API is gated (older Safari,
+        // non-secure contexts). Use the legacy execCommand path against a
+        // hidden textarea — this is the same pattern boot.js uses for the
+        // "Copy" buttons on code blocks.
         const ta=document.createElement('textarea');
         ta.value=abs;
         ta.style.cssText='position:fixed;left:-9999px;top:-9999px;';
@@ -11370,6 +8218,8 @@ function _showFileContextMenu(e, item){
   };
   menu.appendChild(copyPathItem);
 
+  // Download as zip — only for directories. Streams the folder contents
+  // through /api/folder/download which builds the zip on the fly.
   if(item.type==='dir'){
     const dlItem=document.createElement('div');
     dlItem.textContent=t('download_folder');
@@ -11385,6 +8235,7 @@ function _showFileContextMenu(e, item){
     menu.appendChild(dlItem);
   }
 
+  // Divider + Delete
   const sep=document.createElement('hr');
   sep.style.cssText='border:none;border-top:1px solid var(--border);margin:4px 0;';
   menu.appendChild(sep);
@@ -11446,7 +8297,9 @@ async function deleteWorkspaceFile(relPath, name){
   }catch(e){setStatus(t('delete_failed')+e.message);}
 }
 
-async function promptNewFile(targetDir = S.currentDir || '.'){
+async function promptNewFile(){
+  // If no active session but a default workspace is configured, auto-create
+  // a session bound to it so workspace actions work on the blank new-chat page.
   if(!S.session){
     const ws=(typeof S._profileDefaultWorkspace==='string'&&S._profileDefaultWorkspace)||'';
     if(!ws) return;
@@ -11456,24 +8309,19 @@ async function promptNewFile(targetDir = S.currentDir || '.'){
     }catch(e){setStatus(t('create_failed')+e.message);return;}
   }
   if(!S.session)return;
-  const targetLabel=_workspaceCreateTargetLabel(targetDir);
-  const name=await showPromptDialog({
-    title:t('new_file_prompt_title', targetLabel),
-    placeholder:'filename.txt',
-    confirmLabel:t('create')
-  });
-  if(!name||!name.trim()) return;
-  const relPath=_workspaceJoinTargetPath(targetDir,name);
+  const name=await showPromptDialog({title:t('new_file_prompt'),placeholder:'filename.txt',confirmLabel:t('create')});
+  if(!name||!name.trim())return;
+  const relPath=S.currentDir==='.'?name.trim():(S.currentDir+'/'+name.trim());
   try{
     await api('/api/file/create',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath,content:''})});
     showToast(t('created')+name.trim());
-    delete S._dirCache[targetDir || '.'];
     await loadDir(S.currentDir);
     openFile(relPath);
   }catch(e){setStatus(t('create_failed')+e.message);}
 }
 
-async function promptNewFolder(targetDir = S.currentDir || '.'){
+async function promptNewFolder(){
+  // Same auto-create-session logic as promptNewFile for the blank page.
   if(!S.session){
     const ws=(typeof S._profileDefaultWorkspace==='string'&&S._profileDefaultWorkspace)||'';
     if(!ws) return;
@@ -11483,26 +8331,20 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
     }catch(e){setStatus(t('folder_create_failed')+e.message);return;}
   }
   if(!S.session)return;
-  const targetLabel=_workspaceCreateTargetLabel(targetDir);
-  const name=await showPromptDialog({
-    title:t('new_folder_prompt_title', targetLabel),
-    placeholder:'folder-name',
-    confirmLabel:t('create')
-  });
-  if(!name||!name.trim()) return;
-  const relPath=_workspaceJoinTargetPath(targetDir,name);
+  const name=await showPromptDialog({title:t('new_folder_prompt'),placeholder:'folder-name',confirmLabel:t('create')});
+  if(!name||!name.trim())return;
+  const relPath=S.currentDir==='.'?name.trim():(S.currentDir+'/'+name.trim());
   try{
     await api('/api/file/create-dir',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath})});
     showToast(t('folder_created')+name.trim());
-    delete S._dirCache[targetDir || '.'];
     await loadDir(S.currentDir);
-    const absPath=S.session.workspace?(targetDir==='.'?`${S.session.workspace}/${name.trim()}`:`${S.session.workspace}/${targetDir}/${name.trim()}`):null;
+    // Offer to add the new folder as a space (#782)
+    const absPath=S.session.workspace?((S.currentDir==='.'?S.session.workspace:S.session.workspace+'/'+S.currentDir)+'/'+name.trim()):null;
     if(absPath){
       const addAsSpace=await showConfirmDialog({
         title:t('folder_add_as_space_title'),
         message:t('folder_add_as_space_msg'),
         confirmLabel:t('folder_add_as_space_btn'),
-        cancelLabel:t('status_no'),
         focusCancel:true
       });
       if(addAsSpace){

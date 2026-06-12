@@ -23,8 +23,6 @@ REPO = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO.parent / ".hermes" / "hermes-agent"))
 
-from api.config import CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS
-
 
 def read(rel):
     return (REPO / rel).read_text(encoding="utf-8")
@@ -368,7 +366,7 @@ class TestLiveModelsCustomProviderFallback:
             {
                 "url": "https://right.codes/codex/v1/models",
                 "authorization": "Bearer right-key",
-                "timeout": CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS,
+                "timeout": 8,
             }
         ]
         assert [m["id"] for m in resp["models"]] == ["right-live-model"]
