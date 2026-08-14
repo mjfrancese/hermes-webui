@@ -3453,6 +3453,15 @@ def _serve_manifest(handler) -> bool:
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
 
+    # ── Pending-questions inbox (Track B 2026-05-14, starrco-patches) ─────
+    if parsed.path == "/inbox/questions" or parsed.path.startswith("/api/inbox/"):
+        try:
+            from api.inbox_questions import handle_get as inbox_get
+            if inbox_get(handler, parsed):
+                return True
+        except Exception:
+            logger.exception("inbox_questions GET handler failed")
+
     if parsed.path.startswith("/session/static/"):
         # Strip the leading "/session" so _serve_static() sees a path that
         # starts with "/static/" (its required prefix). _serve_static enforces
@@ -4622,6 +4631,19 @@ def handle_get(handler, parsed) -> bool:
 
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
+
+    # ── Pending-questions inbox (Track B 2026-05-14, starrco-patches) ─────
+    # Routed BEFORE CSRF: this endpoint is tailnet-only per operator decision
+    # and the standard CSRF gate rejects same-origin fetch() with no Origin
+    # header from <script>fetch()</script>. Inbox is open by design.
+    if parsed.path.startswith("/api/inbox/"):
+        try:
+            from api.inbox_questions import handle_post as inbox_post
+            if inbox_post(handler, parsed):
+                return True
+        except Exception:
+            logger.exception("inbox_questions POST handler failed")
+
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger)
     if parsed.path == "/api/csp-report":
         if diag:
